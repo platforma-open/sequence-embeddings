@@ -1,0 +1,356 @@
+// Sequence Embeddings — workflow root.
+//
+// Detects modality from the input anchor axis, collects sequences, runs the
+// Python embedding step (ESM-2 universal), and imports each per-scope output
+// TSV as a two-axis PColumn keyed on (input axis × pl7.app/embeddingDim).
+//
+// M1 scope (this file at first cut): peptide modality end-to-end. Antibody
+// and TCR modality branches are gated by `ll.panic` and filled in by M2 —
+// the structure stays the same; only the per-scope sequence gathering differs.
+//
+// Asset usage: model weights live in `support/assets-protein-embeddings/`
+// (esm2-650M, esm2-150M) and are mounted via `assets.importAsset` +
+// `exec.builder().addAsset`. The Python main.py loads weights from the mount
+// path via `from_pretrained(local_path)` — no HuggingFace Hub network call
+// at runtime.
+
+wf := import("@platforma-sdk/workflow-tengo:workflow")
+exec := import("@platforma-sdk/workflow-tengo:exec")
+assets := import("@platforma-sdk/workflow-tengo:assets")
+ll := import("@platforma-sdk/workflow-tengo:ll")
+pframes := import("@platforma-sdk/workflow-tengo:pframes")
+xsv := import("@platforma-sdk/workflow-tengo:pframes.xsv")
+pSpec := import("@platforma-sdk/workflow-tengo:pframes.spec")
+canonical := import("@platforma-sdk/workflow-tengo:canonical")
+maps := import("@platforma-sdk/workflow-tengo:maps")
+
+columnSpecs := import(":columns")
+
+// ---------------------------------------------------------------------------
+// Modality detection. Mirrors sequence-properties' `detectMode` — keep the
+// detection rules consistent across the two blocks so users get matching
+// modality calls for the same input.
+// ---------------------------------------------------------------------------
+
+detectMode := func(axisSpec) {
+	dom := axisSpec.domain
+	if axisSpec.name == "pl7.app/variantKey" {
+		if dom != undefined && dom["pl7.app/peptide/extractionRunId"] != undefined {
+			return "peptide"
+		}
+		if dom != undefined && dom["pl7.app/vdj/clonotypingRunId"] != undefined {
+			return "antibody_tcr_universal"
+		}
+	}
+	if axisSpec.name == "pl7.app/vdj/cloneId" {
+		return "antibody_tcr_legacy_bulk"
+	}
+	if axisSpec.name == "pl7.app/vdj/clonotypeKey" {
+		return "antibody_tcr_legacy_bulk"
+	}
+	if axisSpec.name == "pl7.app/vdj/scClonotypeKey" {
+		return "antibody_tcr_legacy_sc"
+	}
+	return ""
+}
+
+// Bulk MiXCR chain enum → receptor (SD-008). Mirrors sequence-properties.
+CHAIN_TO_RECEPTOR := {
+	IGHeavy: "IG", IGLight: "IG", IGKappa: "IG", IGLambda: "IG",
+	TCRAlpha: "TCRAB", TCRBeta: "TCRAB", TCRGamma: "TCRGD", TCRDelta: "TCRGD"
+}
+
+// Resolve receptor from the key-axis domain: explicit pl7.app/vdj/receptor wins,
+// then derive from pl7.app/vdj/chain (SD-008), else default IG (R3). Used only to
+// stamp receptor-aware labels on output columns; scope availability (incl. the
+// IG-only Fv gate) was already decided model-side.
+resolveReceptor := func(domain) {
+	if domain == undefined { return "IG" }
+	r := domain["pl7.app/vdj/receptor"]
+	if r == "IG" || r == "TCRAB" || r == "TCRGD" { return r }
+	c := domain["pl7.app/vdj/chain"]
+	if c != undefined && CHAIN_TO_RECEPTOR[c] != undefined { return CHAIN_TO_RECEPTOR[c] }
+	return "IG"
+}
+
+// ---------------------------------------------------------------------------
+// wf.prepare — resolve the input column bundle for the body.
+// ---------------------------------------------------------------------------
+
+wf.prepare(func(args) {
+	bb := wf.createPBundleBuilder()
+	bb.ignoreMissingDomains()
+	bb.addAnchor("main", args.inputAnchor)
+
+	// Pull in each selected scope's sequence column(s) by their universal id.
+	// The model already picked these (availableScopes) and resolved them against
+	// the same anchor — here we just resolve the ids, no re-detection (slice 01
+	// R6). Fv carries two ids ([VH, VL]); single-chain scopes carry one.
+	// Mirrors clonotype-clustering's `for ref in args.sequencesRef`.
+	for scope in args.selectedScopes {
+		for colId in scope.columns {
+			bb.addSingle(colId)
+		}
+	}
+
+	return { columns: bb.build() }
+})
+
+// ---------------------------------------------------------------------------
+// wf.body — orchestrate modality detection, sequence assembly, Python compute,
+// and PColumn emission.
+// ---------------------------------------------------------------------------
+
+wf.body(func(args) {
+	blockId := wf.blockId().getDataAsJson()
+	bundle := args.columns
+	datasetSpec := bundle.getSpec(args.inputAnchor)
+
+	axes := datasetSpec.axesSpec
+	if len(axes) == 0 {
+		ll.panic("input anchor has no axes")
+	}
+
+	// R1a: first axis matching a recognized name + domain.
+	keyAxisIdx := -1
+	keyAxisSpec := undefined
+	mode := ""
+	for i, axisSpec in axes {
+		m := detectMode(axisSpec)
+		if m != "" {
+			keyAxisIdx = i
+			keyAxisSpec = axisSpec
+			mode = m
+			break
+		}
+	}
+	if mode == "" {
+		ll.panic("no recognized sequence key axis found; connect a peptide extraction or MiXCR clonotyping dataset")
+	}
+
+	receptor := resolveReceptor(keyAxisSpec.domain) // R3: axis receptor → axis chain → IG
+
+	// Device tier + model are resolved here, at plan time, via exec.hasGpu — the
+	// backend's GPU-availability flag (slice 01 R8 / R21). The chosen checkpoint
+	// is mounted and its path passed to Python; Python only sets dtype/placement
+	// (fp16 on CUDA, fp32 on CPU) and confirms the device at runtime (R18).
+	// .gpuMemory() is a permanent error on a GPU-less backend, so the GPU request
+	// is gated on exec.hasGpu. args.device ("auto" | "cpu" | "gpu") is projected
+	// from BlockData; "cpu" forces the CPU tier even on a GPU backend.
+	useGpu := exec.hasGpu && (args.device == "auto" || args.device == "gpu")
+	device := "cpu"
+	modelTag := "esm2-150M"
+	if useGpu {
+		device = "gpu"
+		modelTag = "esm2-650M"
+	}
+
+	// -----------------------------------------------------------------------
+	// Sequence collection — build the per-mode input TSV plus the scope list.
+	// -----------------------------------------------------------------------
+
+	seqTb := pframes.tsvFileBuilder()
+	seqTb.setAxisHeader(keyAxisSpec, "entity_key")
+
+	// Unique sequence-column ids across all selected scopes → stable "seqN"
+	// headers, assigned in sorted-id order so identical selections produce
+	// byte-identical TSVs (dedup canonicality — workflow.md). The same column
+	// can back more than one scope (e.g. a VDJRegion column also feeds Fv), so
+	// dedup the ids before adding columns.
+	colIdSet := {}
+	for scope in args.selectedScopes {
+		for colId in scope.columns {
+			colIdSet[colId] = true
+		}
+	}
+	colHeaders := {}
+	for i, colId in maps.getKeys(colIdSet) {
+		h := "seq" + string(i)
+		colHeaders[colId] = h
+		seqTb.add(bundle.getColumn(colId), { header: h })
+	}
+
+	// One plan entry per selected scope, keyed by a clean filename-safe scope
+	// name (feature[_chain]); the map gives canonical (sorted) scope order. All
+	// scopes route to ESM-2 — the checkpoint was chosen by device tier above
+	// (gpu → esm2-650M, cpu → esm2-150M). Slice 01 R8 / Model Routing.
+	scopeMap := {}
+	for scope in args.selectedScopes {
+		name := scope.feature
+		if scope.chain != "" {
+			name = scope.feature + "_" + scope.chain
+		}
+		srcHeaders := []
+		for colId in scope.columns {
+			srcHeaders = append(srcHeaders, colHeaders[colId])
+		}
+		scopeMap[name] = {
+			name: name,
+			feature: scope.feature,
+			chain: scope.chain,
+			model: modelTag,
+			receptor: receptor,
+			sourceColumns: srcHeaders
+		}
+	}
+	scopes := []
+	for _, name in maps.getKeys(scopeMap) {
+		scopes = append(scopes, scopeMap[name])
+	}
+
+	if len(scopes) == 0 {
+		ll.panic("no scopes selected — nothing to embed")
+	}
+
+	seqTb.mem("4GiB")
+	seqTb.cpu(1)
+	inputTsv := seqTb.build()
+
+	// -----------------------------------------------------------------------
+	// Plan JSON — Python contract for which scopes to run and how to route.
+	// Canonical encoding keeps the resource bytes deterministic for dedup.
+	// -----------------------------------------------------------------------
+
+	plan := {
+		mode: mode,
+		receptor: receptor,
+		device: device,
+		scopes: scopes
+	}
+
+	// -----------------------------------------------------------------------
+	// Asset import — only the checkpoint chosen by device tier (above) is
+	// mounted; its path is passed to Python via --model-path (slice 01 R19a).
+	// -----------------------------------------------------------------------
+
+	// importAsset requires a string-literal ID — the builder resolves asset
+	// dependencies statically, so a variable ID is rejected. Select the
+	// checkpoint via if/else over literal imports; only the device tier's asset
+	// is imported at runtime (R19a).
+	modelAsset := undefined
+	if useGpu {
+		modelAsset = assets.importAsset("@platforma-open/milaboratories.protein-embeddings-assets:esm2-650M")
+	} else {
+		modelAsset = assets.importAsset("@platforma-open/milaboratories.protein-embeddings-assets:esm2-150M")
+	}
+
+	// -----------------------------------------------------------------------
+	// Python compute step. ESM-2 650M is ~2.6 GB; allocate enough RAM for the
+	// model + activations on a typical batch. Memory (GiB) and CPU cores are
+	// user-overridable in Advanced Settings → Resource Allocation (R21);
+	// undefined → these defaults.
+	// -----------------------------------------------------------------------
+
+	embedMem := "32GiB"
+	embedCpu := 16
+	if !is_undefined(args.mem) {
+		embedMem = string(args.mem) + "GiB"
+	}
+	if !is_undefined(args.cpu) {
+		embedCpu = args.cpu
+	}
+
+	soft := assets.importSoftware("@platforma-open/milaboratories.sequence-embeddings.software:compute-embeddings")
+	pyBuilder := exec.builder().
+		software(soft).
+		mem(embedMem).
+		cpu(embedCpu).
+		addAsset(modelAsset, "model", "config.json").
+		addFile("input.tsv", inputTsv).
+		writeFile("plan.json", canonical.encode(plan)).
+		arg("--input").arg("input.tsv").
+		arg("--plan").arg("plan.json").
+		arg("--output-dir").arg("embeddings").
+		arg("--stats").arg("stats.json").
+		arg("--model-path").arg("model").
+		arg("--model-name").arg(modelTag).
+		mkDir("embeddings")
+
+	// Request a GPU only when the backend advertises one (slice 01 R21). Gating
+	// on exec.hasGpu is mandatory — .gpuMemory() permanently errors on a GPU-less
+	// backend. cpu()/mem() above are required whenever gpuMemory() is set.
+	if useGpu {
+		pyBuilder.gpuMemory("16GiB")
+	} else {
+		// CPU tier: let main.py auto-size workers × threads (--workers 0) from the
+		// CPUs/RAM the backend actually granted this exec — argExpr substitutes
+		// {system.*} at runtime, so a request the host can't satisfy (e.g. 20 CPU
+		// on a 10-core node) passes the real, clamped allocation, not the request.
+		// {system.ram.gb} is base-10 GB, matching main.py's memory accounting.
+		// (GPU path stays single-process — the script ignores --workers there, R21.)
+		pyBuilder.
+			arg("--workers").arg("0").
+			arg("--cpus").argExpr("{system.cpu}").
+			arg("--max-memory-gb").argExpr("{system.ram.gb}")
+	}
+
+	// Declare each per-scope output file so the platform captures it into the
+	// result graph. Builder mutates in place per the 3d-structure-clustering
+	// pattern (clustering.tpl.tengo:115-124) — no rebind needed.
+	for scope in scopes {
+		pyBuilder.saveFile("embeddings/embeddings_" + scope.name + ".tsv")
+	}
+
+	pyRun := pyBuilder.
+		saveFileContent("stats.json").
+		saveStderrStream().
+		run()
+
+	statsResource := pyRun.getFileContent("stats.json")
+	processingLog := pyRun.getStderrStream()
+
+	// -----------------------------------------------------------------------
+	// Per-scope xsv.importFile — one call per scope. Each produces one
+	// two-axis PColumn (entity_key × pl7.app/embeddingDim). The output TSV
+	// path follows Python's contract: `embeddings/embeddings_{scope.name}.tsv`.
+	// -----------------------------------------------------------------------
+
+	// The input axis should be visible by default in tables — same override
+	// as sequence-properties uses.
+	visibleKeyAxisSpec := columnSpecs.cloneSpec(keyAxisSpec, undefined, {
+		"pl7.app/table/visibility": "default"
+	})
+
+	trace := pSpec.makeTrace(datasetSpec, {
+		type: "milaboratories.sequence-embeddings",
+		importance: 30,
+		label: "Sequence Embeddings",
+		id: blockId
+	})
+
+	stamp := func(spec) {
+		return trace.inject(columnSpecs.cloneSpec(spec,
+			{ "pl7.app/blockId": blockId },
+			undefined))
+	}
+
+	pf := pframes.pFrameBuilder()
+	for scope in scopes {
+		colDescriptor := columnSpecs.buildEmbeddingColumn(scope, visibleKeyAxisSpec)
+		scopeTsv := pyRun.getFile("embeddings/embeddings_" + scope.name + ".tsv")
+		imported := xsv.importFile(scopeTsv, "tsv", {
+			axes: colDescriptor.axes,
+			columns: [colDescriptor.column],
+			storageFormat: "Parquet",
+			partitionKeyLength: 0
+		}, { splitDataAndSpec: true, cpu: 1, mem: "4GiB" })
+		// xsv.importFile returns a map keyed by column id. Sorted iteration so
+		// dedup is canonical even though we only have one column per call.
+		for _, k in maps.getKeys(imported) {
+			v := imported[k]
+			pf.add(scope.name, stamp(v.spec), v.data)
+		}
+	}
+	finalPf := pf.build()
+
+	return {
+		outputs: {
+			embeddingsPf: pframes.exportFrame(finalPf),
+			stats: statsResource,
+			processingLog: processingLog
+		},
+		exports: {
+			embeddings: finalPf
+		}
+	}
+})

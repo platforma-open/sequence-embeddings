@@ -1,0 +1,245 @@
+// Output PColumn specs emitted by sequence-embeddings.
+//
+// Public surface:
+//
+//   - `MODEL_DIM`                       — model tag → embedding dimension D.
+//                                         Source of truth for the embedding-
+//                                         dim axis size.
+//   - `MODEL_LABEL`                     — model tag → human-readable label
+//                                         fragment used in column labels.
+//   - `buildEmbeddingColumn(scope, keyAxisSpec)`
+//                                       — returns `{ axes, column }` ready for
+//                                         xsv.importFile. One call per
+//                                         emitted (scope × model) combination.
+//   - `cloneSpec(spec, dExtras, aExtras)` — spec-cloning helper used by main
+//                                         to layer blockId / trace onto the
+//                                         imported column's spec.
+//
+// The input axis (clonotypeKey / variantKey / scClonotypeKey) passes through
+// verbatim from the upstream block — slice 01 R2. The embedding-dim axis is
+// always `pl7.app/embeddingDim`, integer-typed.
+//
+// Long-format TSV contract: each per-scope file has columns
+// (entity_key, embedding_dim, value); xsv.importFile builds the two-axis
+// PColumn from this directly.
+
+ll := import("@platforma-sdk/workflow-tengo:ll")
+
+// Embedding dimension per model. Sourced from the model architecture (slice 01
+// R17 / pcolumn-spec.md). Used to validate Python output against the axis spec.
+MODEL_DIM := {
+	"esm2-650M": 1280,
+	"esm2-150M": 640
+}
+
+// Human-readable model fragment for column labels.
+MODEL_LABEL := {
+	"esm2-650M": "ESM-2 650M",
+	"esm2-150M": "ESM-2 150M"
+}
+
+// Order priority per scope. Source: pcolumn-spec.md "Order Priority Summary".
+// Higher = further left in the Lead Selection table. 55000 is reserved for the
+// v2 paired αβ SCEPTR column — leave the gap for forward compatibility.
+ORDER_PRIORITY := {
+	"peptide": 60000,
+	"CDR3_A": 58000,
+	"CDR3_B": 57700,
+	"VDJRegion_esm2_A": 57000,
+	"VDJRegion_esm2_B": 56000,
+	"Fv": 54000
+}
+
+// Receptor + chain → human label fragments. Spec R13a: PColumn name and
+// chain domain are unchanged; only the label varies. Mirrors the same helper
+// in sequence-properties — keep in sync if either evolves.
+labelFragments := func(receptor, chain) {
+	if receptor == "TCRAB" {
+		if chain == "A" { return { cdr3: "CDR-α3", fullChain: "Vα" } }
+		if chain == "B" { return { cdr3: "CDR-β3", fullChain: "Vβ" } }
+	}
+	if receptor == "TCRGD" {
+		if chain == "A" { return { cdr3: "CDR-γ3", fullChain: "Vγ" } }
+		if chain == "B" { return { cdr3: "CDR-δ3", fullChain: "Vδ" } }
+	}
+	// IG / unknown — antibody convention.
+	if chain == "A" { return { cdr3: "CDR-H3", fullChain: "VH" } }
+	return { cdr3: "CDR-L3", fullChain: "VL" }
+}
+
+// Embedding-dim axis spec. Same shape for every emitted column — D is encoded
+// in the axis values (0..D-1), not the axis spec itself; downstream consumers
+// read D from the data shape and from pl7.app/embedding/model in the value
+// column's domain.
+EMBEDDING_DIM_AXIS := {
+	name: "pl7.app/embeddingDim",
+	type: "Int",
+	annotations: {
+		"pl7.app/label": "Embedding Dimension",
+		"pl7.app/description": "Index of the embedding vector component, 0 through D-1. D is determined by the model that produced the embeddings (read pl7.app/embedding/model on the value column for the model identity)."
+	}
+}
+
+// Build the human-readable label for a scope's column. Composed of a
+// chain-aware fragment plus the model fragment.
+buildLabel := func(scope) {
+	modelLabel := MODEL_LABEL[scope.model]
+	if scope.feature == "peptide" {
+		return "Peptide Embedding (" + modelLabel + ")"
+	}
+	if scope.feature == "Fv" {
+		return "Fv Embedding (" + modelLabel + ")"
+	}
+	if scope.feature == "scFv" {
+		return "scFv Embedding (" + modelLabel + ")"
+	}
+	frag := labelFragments(scope.receptor, scope.chain)
+	if scope.feature == "CDR3" {
+		return frag.cdr3 + " Embedding (" + modelLabel + ")"
+	}
+	if scope.feature == "VDJRegion" {
+		return frag.fullChain + " Embedding (" + modelLabel + ")"
+	}
+	return "Embedding (" + modelLabel + ")"
+}
+
+// Per-scope description annotation. CDR3-only inputs are short — flag the
+// quality caveat in the description so the user sees it at column-header time
+// (no need to dig into the spec).
+buildDescription := func(scope) {
+	modelLabel := MODEL_LABEL[scope.model]
+	if scope.feature == "peptide" {
+		return "Per-residue mean-pooled embedding from the protein language model " + modelLabel + ". Each row corresponds to one peptide; each column position is a dimension of the learned vector. Do not mix with embeddings from other models — read pl7.app/embedding/model on this column."
+	}
+	if scope.feature == "CDR3" {
+		return "Per-residue mean-pooled embedding of the CDR3 sequence from " + modelLabel + ". CDR3-only inputs are short (≈10–25 aa); embedding quality is lower than full-chain (VDJRegion) inputs."
+	}
+	if scope.feature == "VDJRegion" {
+		return "Per-residue mean-pooled embedding of the full variable-domain (VDJRegion) sequence from " + modelLabel + ". Suitable for V-gene-family identification, repertoire-level UMAP visualization, and full-chain similarity search."
+	}
+	if scope.feature == "Fv" {
+		return "Paired Fv embedding from " + modelLabel + ": the VH and VL VDJRegion embeddings, each mean-pooled independently, concatenated in fixed order (VH then VL). No sequence join and no separator token (ESM-2 has none); the dimension is twice the single-chain embedding."
+	}
+	if scope.feature == "scFv" {
+		return "Per-residue mean-pooled embedding of the full scFv construct (VH–linker–VL, a single polypeptide) from " + modelLabel + ", embedded in one pass so cross-chain context is captured."
+	}
+	return "Sequence embedding from " + modelLabel + "."
+}
+
+// Pick the order priority for a scope. Per pcolumn-spec.md ordering summary.
+// Returns the integer priority; the caller stringifies it for the annotation
+// value (PColumn annotations are string-typed).
+buildOrderPriority := func(scope) {
+	if scope.feature == "peptide" { return ORDER_PRIORITY["peptide"] }
+	if scope.feature == "CDR3" {
+		if scope.chain == "A" { return ORDER_PRIORITY["CDR3_A"] }
+		return ORDER_PRIORITY["CDR3_B"]
+	}
+	if scope.feature == "VDJRegion" {
+		if scope.chain == "A" { return ORDER_PRIORITY["VDJRegion_esm2_A"] }
+		return ORDER_PRIORITY["VDJRegion_esm2_B"]
+	}
+	if scope.feature == "Fv" { return ORDER_PRIORITY["Fv"] }
+	return 50000
+}
+
+// Build the per-scope output column descriptor for xsv.importFile.
+//
+// `scope` shape:
+//   {
+//     name:     string,   // TSV file basename / column id, e.g. "peptide", "CDR3_A"
+//     feature:  string,   // "peptide" | "CDR3" | "VDJRegion" | "Fv"
+//     chain:    string,   // "A" | "B" | "" (peptide or Fv)
+//     model:    string,   // "esm2-650M" | "esm2-150M"
+//     receptor: string    // "IG" | "TCRAB" | "TCRGD" | "" (peptide)
+//   }
+//
+// `keyAxisSpec` is the input axis spec passed through verbatim — slice 01 R2.
+//
+// Returns `{ axes, column }` shaped for xsv.importFile with a long-format TSV
+// (columns entity_key, embedding_dim, value). The caller layers blockId and
+// trace onto the resulting spec via `cloneSpec` after xsv.importFile.
+buildEmbeddingColumn := func(scope, keyAxisSpec) {
+	dom := {
+		"pl7.app/feature": scope.feature,
+		"pl7.app/embedding/model": scope.model
+	}
+	// VDJ scopes carry their chain in the domain. Peptide and Fv (which spans
+	// both chains) do not.
+	if scope.chain != "" {
+		dom["pl7.app/vdj/scClonotypeChain"] = scope.chain
+	}
+
+	return {
+		axes: [
+			{ column: "entity_key", spec: keyAxisSpec },
+			{ column: "embedding_dim", spec: EMBEDDING_DIM_AXIS }
+		],
+		column: {
+			column: "value",
+			id: scope.name,
+			naRegex: "",
+			allowNA: false,
+			spec: {
+				name: "pl7.app/embedding",
+				valueType: "Double",
+				domain: dom,
+				annotations: {
+					"pl7.app/label": buildLabel(scope),
+					"pl7.app/description": buildDescription(scope),
+					"pl7.app/format": ".6f",
+					"pl7.app/table/visibility": "optional",
+					"pl7.app/table/orderPriority": string(buildOrderPriority(scope))
+				}
+			}
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec-cloning helper — same shape as sequence-properties' cloneSpec. Builds
+// a fresh spec dict with optional domain and annotation extras. Callers use
+// this to layer per-consumer overrides (e.g. `pl7.app/blockId` in domain,
+// pSpec trace injection) without mutating the input spec.
+// ---------------------------------------------------------------------------
+
+cloneSpec := func(spec, domainExtras, annotationExtras) {
+	// Shallow-copy every top-level key (kind, name, valueType, axesSpec, ...)
+	// so specs already filled in by xsv.importFile keep their kind + axesSpec.
+	out := {}
+	for k, v in spec { out[k] = v }
+
+	// Overlay domain — always build a fresh dict so the result never aliases
+	// the caller's input domain.
+	newDomain := {}
+	if spec.domain {
+		for k, v in spec.domain { newDomain[k] = v }
+	}
+	if domainExtras {
+		for k, v in domainExtras { newDomain[k] = v }
+	}
+	out.domain = newDomain
+
+	// Overlay annotations — same fresh-dict rule.
+	newAnnotations := {}
+	if spec.annotations {
+		for k, v in spec.annotations { newAnnotations[k] = v }
+	}
+	if annotationExtras {
+		for k, v in annotationExtras { newAnnotations[k] = v }
+	}
+	out.annotations = newAnnotations
+
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Public exports.
+// ---------------------------------------------------------------------------
+
+export ll.toStrict({
+	MODEL_DIM: MODEL_DIM,
+	MODEL_LABEL: MODEL_LABEL,
+	buildEmbeddingColumn: buildEmbeddingColumn,
+	cloneSpec: cloneSpec
+})
