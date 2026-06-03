@@ -1,4 +1,4 @@
-import { createPlDataTableStateV2, DataModelBuilder } from "@platforma-sdk/model";
+import { DataModelBuilder } from "@platforma-sdk/model";
 import type { BlockDataV1 } from "./types";
 
 /**
@@ -16,5 +16,4 @@ export const blockDataModel = new DataModelBuilder()
     // Resource defaults for the embedding step (Advanced Settings).
     mem: 32,
     cpu: 16,
-    tableState: createPlDataTableStateV2(),
   }));

@@ -92,7 +92,7 @@ export function buildScopeConfig(
   entries: SeqEntry[],
   receptor: WorkflowReceptor,
   labels: Map<string, string>,
-): ScopeConfig {
+): Omit<ScopeConfig, "forAnchor"> {
   type Internal = AvailableScope & { assembling: boolean };
   const scopes: Internal[] = [];
   const vdjByChain: Partial<Record<"A" | "B", SUniversalPColumnId>> = {};
@@ -159,25 +159,35 @@ export function buildScopeConfig(
     }
   }
 
-  // Paired Fv — IG only, both heavy + light VDJRegion present (R7, R10).
-  const fvAvailable = receptor === "IG" && vdjByChain.A !== undefined && vdjByChain.B !== undefined;
-  if (fvAvailable) {
-    scopes.push({
-      id: "Fv",
-      feature: "Fv",
-      chain: "",
-      columns: [vdjByChain.A!, vdjByChain.B!], // [VH, VL] fixed order
-      label: "Paired Fv",
-      assembling: false,
-    });
+  // scFv inputs: VH and VL are merged inside a single polypeptide, so per-chain
+  // VDJRegion is not a meaningful standalone scope and the paired-Fv concat path
+  // does not apply
+  let fvAvailable = false;
+  if (scFvPresent) {
+    for (let i = scopes.length - 1; i >= 0; i--) {
+      if (scopes[i].feature === "VDJRegion") scopes.splice(i, 1);
+    }
+  } else {
+    // Paired Fv — IG only, both heavy + light VDJRegion present (R7, R10).
+    fvAvailable = receptor === "IG" && vdjByChain.A !== undefined && vdjByChain.B !== undefined;
+    if (fvAvailable) {
+      scopes.push({
+        id: "Fv",
+        feature: "Fv",
+        chain: "",
+        columns: [vdjByChain.A!, vdjByChain.B!], // [VH, VL] fixed order
+        label: "Paired Fv",
+        assembling: false,
+      });
+    }
   }
 
   // Default Selection Rule (R6).
   let defaultsInternal: Internal[];
-  if (fvAvailable) {
+  if (scFvPresent) {
+    defaultsInternal = scopes.filter((s) => s.feature === "scFv"); // scFv construct is the default
+  } else if (fvAvailable) {
     defaultsInternal = scopes.filter((s) => s.feature === "Fv"); // rule 1
-  } else if (scFvPresent) {
-    defaultsInternal = scopes.filter((s) => s.feature === "scFv"); // rule 2
   } else {
     defaultsInternal = scopes.filter((s) => s.assembling); // rule 3 — assembly-trusted columns
     // rule 4 — same-chain CDR3+VDJRegion → keep VDJRegion, drop the redundant CDR3.

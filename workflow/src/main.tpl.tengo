@@ -4,10 +4,6 @@
 // Python embedding step (ESM-2 universal), and imports each per-scope output
 // TSV as a two-axis PColumn keyed on (input axis × pl7.app/embeddingDim).
 //
-// M1 scope (this file at first cut): peptide modality end-to-end. Antibody
-// and TCR modality branches are gated by `ll.panic` and filled in by M2 —
-// the structure stays the same; only the per-scope sequence gathering differs.
-//
 // Asset usage: model weights live in `support/assets-protein-embeddings/`
 // (esm2-650M, esm2-150M) and are mounted via `assets.importAsset` +
 // `exec.builder().addAsset`. The Python main.py loads weights from the mount
@@ -255,7 +251,7 @@ wf.body(func(args) {
 		software(soft).
 		mem(embedMem).
 		cpu(embedCpu).
-		addAsset(modelAsset, "model", "config.json").
+		addAsset(modelAsset, "model").
 		addFile("input.tsv", inputTsv).
 		writeFile("plan.json", canonical.encode(plan)).
 		arg("--input").arg("input.tsv").
@@ -293,11 +289,12 @@ wf.body(func(args) {
 
 	pyRun := pyBuilder.
 		saveFileContent("stats.json").
-		saveStderrStream().
+		saveStdoutStream().
 		run()
 
 	statsResource := pyRun.getFileContent("stats.json")
-	processingLog := pyRun.getStderrStream()
+	// capture stdout as the block log
+	processingLog := pyRun.getStdoutStream()
 
 	// -----------------------------------------------------------------------
 	// Per-scope xsv.importFile — one call per scope. Each produces one
@@ -345,7 +342,6 @@ wf.body(func(args) {
 
 	return {
 		outputs: {
-			embeddingsPf: pframes.exportFrame(finalPf),
 			stats: statsResource,
 			processingLog: processingLog
 		},

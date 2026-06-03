@@ -18,26 +18,40 @@ export const sdkPlugin = defineAppV3(platforma, (app) => {
     app.model.data.defaultBlockLabel = match?.label ?? "";
   });
 
-  // Scope default + reconcile (slice 01 R6 / R6c). Seed `selectedScopes` from
-  // the Default Selection Rule (availableScopes.defaults) once per anchor,
-  // guarded by `scopesInitializedForAnchor`. The guard makes this a one-shot
-  // init, not a continuous resync (same hairpin-tolerated output→data pattern as
-  // the label watch above): on server-patch / panel reopen the key matches and
-  // the user's selection is preserved; on a genuinely new input the key differs
+  // Seed `selectedScopes` from the Default Selection Rule
+  // (availableScopes.defaults) once per anchor, guarded by
+  // `scopesInitializedForAnchor`. The guard makes this a one-shot init, not a
+  // continuous resync (same hairpin-tolerated output→data pattern as the label
+  // watch above): on server-patch / panel reopen the key matches and the
+  // user's selection is preserved; on a genuinely new input the key differs
   // and the new input's defaults apply.
   watchEffect(() => {
     const anchor = app.model.data.inputAnchor;
+    const key = anchor ? JSON.stringify(anchor) : undefined;
+
+    // Dataset changed (or was cleared) since the last seed → drop the previous
+    // input's selection immediately. Without this the old selectedScopes (column
+    // ids resolved against the previous anchor) linger until the new config
+    // resolves, and the workflow would resolve them against the new anchor.
+    if (app.model.data.scopesInitializedForAnchor !== key) {
+      if (app.model.data.selectedScopes.length > 0) app.model.data.selectedScopes = [];
+    }
+
     if (!anchor) {
       if (app.model.data.scopesInitializedForAnchor !== undefined) {
-        app.model.data.selectedScopes = [];
         app.model.data.scopesInitializedForAnchor = undefined;
       }
       return;
     }
-    const key = JSON.stringify(anchor);
+
     if (app.model.data.scopesInitializedForAnchor === key) return;
+
     const config = app.model.outputs.availableScopes;
-    if (!config) return; // scopes for this anchor not resolved yet — wait
+    // `availableScopes` is retentive, so right after a dataset switch it may
+    // still hold the PREVIOUS anchor's config. Gate on `forAnchor` so we seed
+    // this input's defaults — not the retained stale ones — and only stamp the
+    // guard once a config matching this anchor has actually been applied.
+    if (!config || config.forAnchor !== key) return; // wait for the fresh config
     app.model.data.selectedScopes = config.defaults;
     app.model.data.scopesInitializedForAnchor = key;
   });
@@ -46,6 +60,7 @@ export const sdkPlugin = defineAppV3(platforma, (app) => {
     routes: {
       "/": () => MainPage,
     },
+    progress: () => app.model.outputs.isRunning,
   };
 });
 

@@ -28,10 +28,11 @@
       "logo": "file:../logos/block-logo.png",
       "url": "https://github.com/platforma-open/milaboratories.sequence-embeddings",
       "support": "mailto:support@milaboratories.com",
-      "description": "Per-sequence vector embeddings for peptide and antibody/TCR datasets via ESM-2 (universal protein language model, 650M on GPU / 150M ONNX int8 on CPU). Output PColumn is the substrate for downstream clustering and repertoire visualization.",
+      "description": "Per-sequence vector embeddings for peptide and antibody/TCR datasets via ESM-2 (universal protein language model, 650M on GPU / 150M on CPU).",
       "longDescription": "file:../docs/description.md",
       "changelog": "file:../CHANGELOG.md",
-      "tags": ["embeddings", "language-model", "antibody", "tcr", "peptide"],
+      "tags": ["airr", "downstream", "peptide", "embeddings"],
+      "supportedPlatforms": ["linux-x64", "macosx-aarch64"],
       "organization": {
         "name": "MiLaboratories Inc",
         "url": "https://milaboratories.com/",

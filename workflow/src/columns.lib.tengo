@@ -188,7 +188,7 @@ buildEmbeddingColumn := func(scope, keyAxisSpec) {
 					"pl7.app/label": buildLabel(scope),
 					"pl7.app/description": buildDescription(scope),
 					"pl7.app/format": ".6f",
-					"pl7.app/table/visibility": "optional",
+					"pl7.app/table/visibility": "hidden",
 					"pl7.app/table/orderPriority": string(buildOrderPriority(scope))
 				}
 			}

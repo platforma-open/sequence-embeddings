@@ -2,6 +2,7 @@
 import type {
   AvailableScope,
   DeviceMode,
+  ModelTag,
   WorkflowStats,
 } from "@platforma-open/milaboratories.sequence-embeddings.model";
 import type { PlRef } from "@platforma-sdk/model";
@@ -13,26 +14,19 @@ import {
   PlBtnGroup,
   PlDropdownMulti,
   PlDropdownRef,
+  PlLoaderCircular,
   PlLogView,
   PlMaskIcon24,
   PlNumberField,
   PlSectionSeparator,
   PlSlideModal,
 } from "@platforma-sdk/ui-vue";
-import { computed, ref, watch } from "vue";
+import { computed, ref } from "vue";
 import { useApp } from "../app";
 
 const app = useApp();
 
 const logOpen = ref(false);
-const settingsOpen = ref(app.model.data.inputAnchor === undefined);
-
-watch(
-  () => app.model.outputs.isRunning,
-  (isRunning) => {
-    if (isRunning) settingsOpen.value = false;
-  },
-);
 
 // Setter, not a watch on `inputAnchor` — see sequence-properties for the
 // reasoning. A watcher would fire on server-patch object replacements (other
@@ -48,10 +42,8 @@ const deviceOptions: { value: DeviceMode; label: string }[] = [
 ];
 
 // Scope multi-select. Options come from the model's input-shape detection
-// (availableScopes); labels match clonotype-clustering for the sequence scopes,
-// plus this block's "Paired Fv". The picker tracks scope ids; on change we
-// snapshot the full SelectedScope (incl. the column ids) into data so the args
-// lambda stays data-only.
+// (availableScopes). The picker tracks scope ids; on change we snapshot the full
+// SelectedScope (incl. the column ids) into data so the args lambda stays data-only.
 const scopeOptions = computed(() =>
   (app.model.outputs.availableScopes?.options ?? []).map((o) => ({ value: o.id, label: o.label })),
 );
@@ -65,78 +57,72 @@ function onScopesChange(ids: string[]) {
     .map((o) => ({ id: o.id, feature: o.feature, chain: o.chain, columns: o.columns }));
 }
 
-// Stats summary — read after the workflow has produced `stats.json`. Used by
-// the status panel to render "what was computed" without any client-side
-// computation beyond shaping the strings.
+const hasInput = computed(() => app.model.data.inputAnchor !== undefined);
+const hasScopes = computed(() => app.model.data.selectedScopes.length > 0);
+const isRunning = computed(() => app.model.outputs.isRunning === true);
 const stats = computed<WorkflowStats | undefined>(() => app.model.outputs.stats);
+const resultsStale = computed(() => app.model.outputs.resultsStale === true);
 
-const deviceUsedLabel = computed(() => {
-  const used = stats.value?.device_used;
-  if (used === "gpu") return "GPU";
-  if (used === "cpu") return "CPU";
-  return undefined;
+// Report is shown once a run matching the current settings has completed.
+const showResults = computed(
+  () =>
+    hasInput.value && hasScopes.value && !isRunning.value && !!stats.value && !resultsStale.value,
+);
+
+// One-line run header: where it ran, which model, which modality.
+const MODEL_LABELS: Record<ModelTag, string> = {
+  "esm2-650M": "ESM-2 650M",
+  "esm2-150M": "ESM-2 150M",
+};
+const runHeader = computed(() => {
+  const s = stats.value;
+  if (!s) return "";
+  const device = s.device_used === "gpu" ? "GPU" : "CPU";
+  const model = MODEL_LABELS[s.model] ?? s.model;
+  const modality = s.mode === "peptide" ? "Peptide" : "Antibody/TCR";
+  return `Computed on ${device} · ${model} · ${modality}`;
 });
 
-const computedScopeSummaries = computed(() => {
-  if (!stats.value) return [];
-  return stats.value.scopes
-    .filter((s) => s.n_entities > 0)
-    .map((s) => ({
-      key: s.name,
-      // Plain narrative line per scope — keeps the panel readable without
-      // grouping into a sub-table.
-      text: `${s.name}: ${s.n_entities} sequences × ${s.embedding_dim} dims (${s.model})`,
-    }));
+// Map each workflow scope name (feature[_chain]) to the picker label, so the
+// report reads with the same names the user selected (e.g. "Heavy CDR3").
+const scopeLabelByName = computed(() => {
+  const m = new Map<string, string>();
+  for (const o of app.model.outputs.availableScopes?.options ?? []) {
+    const name = o.chain ? `${o.feature}_${o.chain}` : o.feature;
+    m.set(name, o.label);
+  }
+  return m;
 });
+function scopeLabel(name: string): string {
+  return scopeLabelByName.value.get(name) ?? name;
+}
+
+// One line per computed scope: embedded count, plus dropped (+ reason) only when
+// some clonotypes lacked the sequence for that region.
+const reportRows = computed(() =>
+  (stats.value?.scopes ?? []).map((s) => {
+    let text = `${s.n_entities.toLocaleString()} embedded`;
+    if (s.n_dropped_empty > 0) {
+      const reason = s.feature === "Fv" ? "incomplete pair" : "no sequence";
+      text += ` · ${s.n_dropped_empty.toLocaleString()} dropped (${reason})`;
+    }
+    return { key: s.name, region: scopeLabel(s.name), text };
+  }),
+);
+
+// Truncation caps an over-long sequence; the row is still embedded — so it's a
+// quality caveat, not a drop. Surface only when it actually happened.
+const totalTruncated = computed(() =>
+  (stats.value?.scopes ?? []).reduce((acc, s) => acc + (s.n_truncated ?? 0), 0),
+);
 </script>
 
 <template>
   <PlBlockPage>
     <template #title>Sequence Embeddings</template>
-    <template #append>
-      <PlBtnGhost @click.stop="() => (logOpen = true)">
-        Logs
-        <template #append>
-          <PlMaskIcon24 name="file-logs" />
-        </template>
-      </PlBtnGhost>
-      <PlBtnGhost @click.stop="() => (settingsOpen = true)">
-        Settings
-        <template #append>
-          <PlMaskIcon24 name="settings" />
-        </template>
-      </PlBtnGhost>
-    </template>
 
-    <!-- Per-scope errors surfaced from the Python step's stats.json.
-         Empty when everything succeeded; one PlAlert per failure otherwise. -->
-    <PlAlert v-for="err in stats?.errors ?? []" :key="err.scope" type="warn">
-      <strong>{{ err.scope }}</strong
-      >: {{ err.error }}
-    </PlAlert>
-
-    <!-- "What was computed" summary panel, rendered once the workflow has
-         produced stats.json. Empty placeholder otherwise. -->
-    <PlAlert v-if="stats" type="info">
-      <p>
-        Computed on <strong>{{ deviceUsedLabel }}</strong
-        >. Mode: <strong>{{ stats.mode }}</strong
-        >.
-      </p>
-      <ul v-if="computedScopeSummaries.length > 0">
-        <li v-for="s in computedScopeSummaries" :key="s.key">{{ s.text }}</li>
-      </ul>
-      <p v-else>No scopes were computed — check the errors panel and the processing log.</p>
-    </PlAlert>
-
-    <PlAlert v-if="!app.model.data.inputAnchor" type="info">
-      Select an input dataset in Settings to compute embeddings.
-    </PlAlert>
-  </PlBlockPage>
-
-  <PlSlideModal v-model="settingsOpen" close-on-outside-click shadow>
-    <template #title>Settings</template>
-
+    <!-- Settings live on the page: this block has no output table to occupy the
+         canvas, so a slide-out panel would just leave the page empty. -->
     <PlDropdownRef
       :model-value="app.model.data.inputAnchor"
       :options="app.model.outputs.inputOptions"
@@ -146,8 +132,8 @@ const computedScopeSummaries = computed(() => {
       @update:model-value="setInput"
     >
       <template #tooltip>
-        Select the output from a valid read/count processing block (i.e. Peptide Profiling, MiXCR
-        clonotyping, etc.).
+        Select the output from a clonotyping / profiling block (Peptide Profiling, MiXCR
+        Clonotyping, Import V(D)J Data, etc.).
       </template>
     </PlDropdownRef>
 
@@ -156,7 +142,7 @@ const computedScopeSummaries = computed(() => {
       :options="scopeOptions"
       label="Sequences to embed"
       required
-      :disabled="app.model.data.inputAnchor === undefined"
+      :disabled="!hasInput"
       @update:model-value="onScopesChange"
     >
       <template #tooltip>
@@ -192,10 +178,106 @@ const computedScopeSummaries = computed(() => {
         <template #tooltip> CPU cores for the embedding step. Default: 16. </template>
       </PlNumberField>
     </PlAccordionSection>
-  </PlSlideModal>
+
+    <!-- Results are out of date: settings changed since the last completed run.
+         Suppressed while a run is in progress (the running indicator covers it). -->
+    <PlAlert v-if="resultsStale && !isRunning" type="info">
+      Settings changed — press <strong>Run</strong> to update the results.
+    </PlAlert>
+
+    <!-- Running: live status + access to the streaming progress log, so a long
+         CPU run can be watched mid-flight (the log isn't reachable otherwise). -->
+    <div v-if="isRunning" class="results-head">
+      <PlSectionSeparator compact />
+      <div class="results-header">
+        <div class="run-status">
+          <PlLoaderCircular size="16" />
+          <span>Computing embeddings…</span>
+        </div>
+        <PlBtnGhost @click.stop="() => (logOpen = true)">
+          Logs
+          <template #append>
+            <PlMaskIcon24 name="file-logs" />
+          </template>
+        </PlBtnGhost>
+      </div>
+    </div>
+
+    <!-- Run report. -->
+    <template v-if="showResults">
+      <!-- Separator bar above a full-size heading; Logs sits on the heading row
+           (the redefine-clonotypes results-header pattern). -->
+      <div class="results-head">
+        <PlSectionSeparator compact />
+        <div class="results-header">
+          <h3 class="results-title">Results</h3>
+          <PlBtnGhost @click.stop="() => (logOpen = true)">
+            Logs
+            <template #append>
+              <PlMaskIcon24 name="file-logs" />
+            </template>
+          </PlBtnGhost>
+        </div>
+      </div>
+
+      <!-- Per-scope failures from the Python step. -->
+      <PlAlert v-for="err in stats?.errors ?? []" :key="err.scope" type="warn">
+        <strong>{{ scopeLabel(err.scope) }}</strong
+        >: {{ err.error }}
+      </PlAlert>
+
+      <!-- Grouped so the run header + per-scope lines read as one tight block
+           rather than as separately gapped children of the page. -->
+      <div class="results">
+        <div class="results__meta">{{ runHeader }}</div>
+        <template v-if="reportRows.length > 0">
+          <div v-for="row in reportRows" :key="row.key">
+            <strong>{{ row.region }}</strong> — {{ row.text }}
+          </div>
+        </template>
+        <div v-else>
+          No sequences were embedded — check the warnings above and the processing log.
+        </div>
+      </div>
+
+      <PlAlert v-if="totalTruncated > 0" type="warn">
+        {{ totalTruncated.toLocaleString() }} sequence(s) exceeded the model's length limit and were
+        truncated before embedding.
+      </PlAlert>
+    </template>
+  </PlBlockPage>
 
   <PlSlideModal v-model="logOpen" width="80%">
     <template #title>Processing Log</template>
     <PlLogView :log-handle="app.model.outputs.processingLog" />
   </PlSlideModal>
 </template>
+
+<style scoped>
+.results-head {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.results-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.results-title {
+  margin: 0;
+}
+.run-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.results {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.results__meta {
+  color: var(--txt-03, #6b7280);
+}
+</style>

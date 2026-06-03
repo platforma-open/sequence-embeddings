@@ -1,4 +1,4 @@
-import type { PlDataTableStateV2, PlRef, SUniversalPColumnId } from "@platforma-sdk/model";
+import type { PlRef, SUniversalPColumnId } from "@platforma-sdk/model";
 
 /**
  * Workflow modality, mirrored from `workflow/src/main.tpl.tengo` `detectMode`.
@@ -54,6 +54,12 @@ export type AvailableScope = SelectedScope & { label: string };
 export type ScopeConfig = {
   options: AvailableScope[];
   defaults: SelectedScope[];
+  /**
+   * Canonical key (`JSON.stringify`) of the anchor this config was computed for.
+   * The UI's seed watcher gates on it so a retained (stale) config from the
+   * previous input is never applied to the newly selected one.
+   */
+  forAnchor: string;
 };
 
 /**
@@ -122,11 +128,10 @@ export type BlockDataV1 = {
   /**
    * Advanced — host resources for the embedding step (Resource Allocation in
    * Advanced Settings). `mem` is GiB, `cpu` is cores. Undefined → workflow
-   * defaults (8 GiB / 2 cores). R21.
+   * defaults (32 GiB / 16 cores). R21.
    */
   mem?: number;
   cpu?: number;
-  tableState: PlDataTableStateV2;
   defaultBlockLabel?: string;
 };
 

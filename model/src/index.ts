@@ -1,5 +1,5 @@
-import type { InferOutputsType, PFrameHandle } from "@platforma-sdk/model";
-import { BlockModelV3, createPFrameForGraphs, PColumnCollection } from "@platforma-sdk/model";
+import type { InferOutputsType } from "@platforma-sdk/model";
+import { BlockModelV3, PColumnCollection } from "@platforma-sdk/model";
 import { blockDataModel } from "./dataModel";
 import { buildScopeConfig, resolveReceptor, SEQUENCE_SELECTORS } from "./scopes";
 import type { BlockArgs, ScopeConfig, WorkflowStats } from "./types";
@@ -18,7 +18,7 @@ export type {
   WorkflowMode,
   WorkflowReceptor,
   WorkflowScopeStats,
-  WorkflowStats,
+  WorkflowStats
 } from "./types";
 
 /**
@@ -64,7 +64,9 @@ export const platforma = BlockModelV3.create(blockDataModel)
     return {
       inputAnchor: data.inputAnchor,
       device: data.device,
-      selectedScopes: data.selectedScopes,
+      // Sort by the stable picker id so a pure reorder of the multi-select
+      // doesn't change the args bytes and spuriously stale the block.
+      selectedScopes: [...data.selectedScopes].sort((a, b) => a.id.localeCompare(b.id)),
       mem: data.mem,
       cpu: data.cpu,
     };
@@ -105,11 +107,16 @@ export const platforma = BlockModelV3.create(blockDataModel)
         labelOps: { includeNativeLabel: true },
       });
       const labelById = new Map<string, string>((labeled ?? []).map((o) => [o.value, o.label]));
-      return buildScopeConfig(
-        entries.map((e) => ({ id: e.id, spec: e.spec })),
-        receptor,
-        labelById,
-      );
+      return {
+        ...buildScopeConfig(
+          entries.map((e) => ({ id: e.id, spec: e.spec })),
+          receptor,
+          labelById,
+        ),
+        // Stamp the anchor this config belongs to, so the UI seed watcher can
+        // reject a retained (stale) config from the previous input.
+        forAnchor: JSON.stringify(ref),
+      };
     },
     { retentive: true },
   )
@@ -118,21 +125,15 @@ export const platforma = BlockModelV3.create(blockDataModel)
   .output("stats", (ctx) => ctx.outputs?.resolve("stats")?.getDataAsJson<WorkflowStats>())
   // Quick gate for the UI's "running" indicator. Mirrors sequence-properties.
   .output("isRunning", (ctx) => ctx.outputs?.getIsReadyOrError() === false)
+  // Whether the displayed results predate the current settings: true when the
+  // current args differ from the args of the last completed run. The UI hides
+  // the report and prompts a re-run when stale — the redefine-clonotypes pattern
+  .output("resultsStale", (ctx) => {
+    if (ctx.args === undefined || ctx.activeArgs === undefined) return false;
+    return JSON.stringify(ctx.args) !== JSON.stringify(ctx.activeArgs);
+  })
   // Workflow stderr — surfaced as a log viewer in the UI for diagnostics.
   .output("processingLog", (ctx) => ctx.outputs?.resolve("processingLog")?.getLogHandle())
-  // Embedding PFrame handle — for downstream consumer integration (slices 02
-  // and 03 read the exported PFrame via the result pool; this output exists
-  // for any in-block visualization we add later, plus to give the UI a way to
-  // confirm the PFrame is ready).
-  .outputWithStatus("embeddingsPfHandle", (ctx): PFrameHandle | undefined => {
-    const pCols = ctx.outputs?.resolve("embeddingsPf")?.getPColumns();
-    if (pCols === undefined) return undefined;
-    // No in-block visualization in v1 (per the brief — clonotype-space handles
-    // repertoire visualization downstream). createPFrameForGraphs is the
-    // standard handle factory; even without UI it gives the right shape for
-    // the result pool consumers.
-    return createPFrameForGraphs(ctx, pCols);
-  })
   .title(() => "Sequence Embeddings")
   .subtitle((ctx) => ctx.data.defaultBlockLabel ?? "")
   .sections(() => [{ type: "link", href: "/", label: "Main" }])
