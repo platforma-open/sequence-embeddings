@@ -14,8 +14,13 @@ export type WorkflowMode =
 /** Receptor type. Same enum as sequence-properties to keep label conventions aligned. */
 export type WorkflowReceptor = "IG" | "TCRAB" | "TCRGD";
 
-/** Device-mode preference set on the BlockData and projected into args. */
-export type DeviceMode = "auto" | "cpu" | "gpu";
+/**
+ * Model fidelity the user picks in Advanced Settings, projected into args.
+ * `high` → ESM-2 650M (honored even on a CPU-only backend, just slower);
+ * `standard` → ESM-2 150M; `auto` → 650M when the backend advertises a GPU
+ * (`exec.hasGpu`), else 150M.
+ */
+export type Fidelity = "high" | "standard" | "auto";
 
 /**
  * Model tag emitted on the `pl7.app/embedding/model` domain of every output
@@ -88,7 +93,6 @@ export type WorkflowScopeStats = {
  * decisions.
  */
 export type WorkflowStats = {
-  device_requested: DeviceMode;
   device_used: "cpu" | "gpu";
   /** torch dtype actually used: "float16" on CUDA, "float32" otherwise. */
   dtype: string;
@@ -112,7 +116,8 @@ export type WorkflowStats = {
  */
 export type BlockDataV1 = {
   inputAnchor?: PlRef;
-  device: DeviceMode;
+  /** Model fidelity (Advanced Settings → Model fidelity). high|standard|auto. */
+  fidelity: Fidelity;
   /**
    * User-selected scopes to embed (R6). Snapshotted from `availableScopes` on
    * the picker gesture so the args lambda stays `data`-only. Empty until the
@@ -145,7 +150,7 @@ export type BlockData = BlockDataV1;
  */
 export type BlockArgs = {
   inputAnchor: PlRef;
-  device: DeviceMode;
+  fidelity: Fidelity;
   /** Scopes to emit, projected from `data.selectedScopes` (validated non-empty, R6b). */
   selectedScopes: SelectedScope[];
   /** Advanced resource overrides for the embedding step (GiB / cores); undefined → workflow defaults. */

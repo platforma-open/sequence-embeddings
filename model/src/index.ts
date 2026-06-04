@@ -10,7 +10,7 @@ export type {
   BlockArgs,
   BlockData,
   BlockDataV1,
-  DeviceMode,
+  Fidelity,
   ModelTag,
   ScopeConfig,
   ScopeFeature,
@@ -18,7 +18,7 @@ export type {
   WorkflowMode,
   WorkflowReceptor,
   WorkflowScopeStats,
-  WorkflowStats
+  WorkflowStats,
 } from "./types";
 
 /**
@@ -63,7 +63,7 @@ export const platforma = BlockModelV3.create(blockDataModel)
     }
     return {
       inputAnchor: data.inputAnchor,
-      device: data.device,
+      fidelity: data.fidelity,
       // Sort by the stable picker id so a pure reorder of the multi-select
       // doesn't change the args bytes and spuriously stale the block.
       selectedScopes: [...data.selectedScopes].sort((a, b) => a.id.localeCompare(b.id)),

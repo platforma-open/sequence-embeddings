@@ -2,11 +2,6 @@
 //
 // Public surface:
 //
-//   - `MODEL_DIM`                       — model tag → embedding dimension D.
-//                                         Source of truth for the embedding-
-//                                         dim axis size.
-//   - `MODEL_LABEL`                     — model tag → human-readable label
-//                                         fragment used in column labels.
 //   - `buildEmbeddingColumn(scope, keyAxisSpec)`
 //                                       — returns `{ axes, column }` ready for
 //                                         xsv.importFile. One call per
@@ -24,19 +19,6 @@
 // PColumn from this directly.
 
 ll := import("@platforma-sdk/workflow-tengo:ll")
-
-// Embedding dimension per model. Sourced from the model architecture (slice 01
-// R17 / pcolumn-spec.md). Used to validate Python output against the axis spec.
-MODEL_DIM := {
-	"esm2-650M": 1280,
-	"esm2-150M": 640
-}
-
-// Human-readable model fragment for column labels.
-MODEL_LABEL := {
-	"esm2-650M": "ESM-2 650M",
-	"esm2-150M": "ESM-2 150M"
-}
 
 // Order priority per scope. Source: pcolumn-spec.md "Order Priority Summary".
 // Higher = further left in the Lead Selection table. 55000 is reserved for the
@@ -75,55 +57,29 @@ EMBEDDING_DIM_AXIS := {
 	name: "pl7.app/embeddingDim",
 	type: "Int",
 	annotations: {
-		"pl7.app/label": "Embedding Dimension",
-		"pl7.app/description": "Index of the embedding vector component, 0 through D-1. D is determined by the model that produced the embeddings (read pl7.app/embedding/model on the value column for the model identity)."
+		"pl7.app/label": "Embedding Dimension"
 	}
 }
 
-// Build the human-readable label for a scope's column. Composed of a
-// chain-aware fragment plus the model fragment.
+// Build the human-readable label for a scope's column.
 buildLabel := func(scope) {
-	modelLabel := MODEL_LABEL[scope.model]
 	if scope.feature == "peptide" {
-		return "Peptide Embedding (" + modelLabel + ")"
+		return "Peptide Embedding"
 	}
 	if scope.feature == "Fv" {
-		return "Fv Embedding (" + modelLabel + ")"
+		return "Fv Embedding"
 	}
 	if scope.feature == "scFv" {
-		return "scFv Embedding (" + modelLabel + ")"
+		return "scFv Embedding"
 	}
 	frag := labelFragments(scope.receptor, scope.chain)
 	if scope.feature == "CDR3" {
-		return frag.cdr3 + " Embedding (" + modelLabel + ")"
+		return frag.cdr3 + " Embedding"
 	}
 	if scope.feature == "VDJRegion" {
-		return frag.fullChain + " Embedding (" + modelLabel + ")"
+		return frag.fullChain + " Embedding"
 	}
-	return "Embedding (" + modelLabel + ")"
-}
-
-// Per-scope description annotation. CDR3-only inputs are short — flag the
-// quality caveat in the description so the user sees it at column-header time
-// (no need to dig into the spec).
-buildDescription := func(scope) {
-	modelLabel := MODEL_LABEL[scope.model]
-	if scope.feature == "peptide" {
-		return "Per-residue mean-pooled embedding from the protein language model " + modelLabel + ". Each row corresponds to one peptide; each column position is a dimension of the learned vector. Do not mix with embeddings from other models — read pl7.app/embedding/model on this column."
-	}
-	if scope.feature == "CDR3" {
-		return "Per-residue mean-pooled embedding of the CDR3 sequence from " + modelLabel + ". CDR3-only inputs are short (≈10–25 aa); embedding quality is lower than full-chain (VDJRegion) inputs."
-	}
-	if scope.feature == "VDJRegion" {
-		return "Per-residue mean-pooled embedding of the full variable-domain (VDJRegion) sequence from " + modelLabel + ". Suitable for V-gene-family identification, repertoire-level UMAP visualization, and full-chain similarity search."
-	}
-	if scope.feature == "Fv" {
-		return "Paired Fv embedding from " + modelLabel + ": the VH and VL VDJRegion embeddings, each mean-pooled independently, concatenated in fixed order (VH then VL). No sequence join and no separator token (ESM-2 has none); the dimension is twice the single-chain embedding."
-	}
-	if scope.feature == "scFv" {
-		return "Per-residue mean-pooled embedding of the full scFv construct (VH–linker–VL, a single polypeptide) from " + modelLabel + ", embedded in one pass so cross-chain context is captured."
-	}
-	return "Sequence embedding from " + modelLabel + "."
+	return "Embedding"
 }
 
 // Pick the order priority for a scope. Per pcolumn-spec.md ordering summary.
@@ -186,7 +142,6 @@ buildEmbeddingColumn := func(scope, keyAxisSpec) {
 				domain: dom,
 				annotations: {
 					"pl7.app/label": buildLabel(scope),
-					"pl7.app/description": buildDescription(scope),
 					"pl7.app/format": ".6f",
 					"pl7.app/table/visibility": "hidden",
 					"pl7.app/table/orderPriority": string(buildOrderPriority(scope))
@@ -238,8 +193,6 @@ cloneSpec := func(spec, domainExtras, annotationExtras) {
 // ---------------------------------------------------------------------------
 
 export ll.toStrict({
-	MODEL_DIM: MODEL_DIM,
-	MODEL_LABEL: MODEL_LABEL,
 	buildEmbeddingColumn: buildEmbeddingColumn,
 	cloneSpec: cloneSpec
 })

@@ -126,19 +126,21 @@ wf.body(func(args) {
 
 	receptor := resolveReceptor(keyAxisSpec.domain) // R3: axis receptor → axis chain → IG
 
-	// Device tier + model are resolved here, at plan time, via exec.hasGpu — the
-	// backend's GPU-availability flag (slice 01 R8 / R21). The chosen checkpoint
-	// is mounted and its path passed to Python; Python only sets dtype/placement
-	// (fp16 on CUDA, fp32 on CPU) and confirms the device at runtime (R18).
-	// .gpuMemory() is a permanent error on a GPU-less backend, so the GPU request
-	// is gated on exec.hasGpu. args.device ("auto" | "cpu" | "gpu") is projected
-	// from BlockData; "cpu" forces the CPU tier even on a GPU backend.
-	useGpu := exec.hasGpu && (args.device == "auto" || args.device == "gpu")
-	device := "cpu"
+	// Model + device tier, resolved at plan time. Fidelity (args.fidelity:
+	// "high" | "standard" | "auto") is the user's MODEL choice; exec.hasGpu — the
+	// backend's GPU-availability flag.
+	//   high     → ESM-2 650M (honored even on a CPU-only backend, just slower)
+	//   standard → ESM-2 150M
+	//   auto     → 650M when a GPU is advertised, else 150M
+	// Device follows the backend: GPU when exec.hasGpu, else CPU. Python confirms
+	// the device (torch.cuda) and picks dtype (fp16 CUDA / fp32 CPU) at runtime
 	modelTag := "esm2-150M"
-	if useGpu {
-		device = "gpu"
+	if args.fidelity == "high" || (args.fidelity == "auto" && exec.hasGpu) {
 		modelTag = "esm2-650M"
+	}
+	device := "cpu"
+	if exec.hasGpu {
+		device = "gpu"
 	}
 
 	// -----------------------------------------------------------------------
@@ -215,16 +217,16 @@ wf.body(func(args) {
 	}
 
 	// -----------------------------------------------------------------------
-	// Asset import — only the checkpoint chosen by device tier (above) is
-	// mounted; its path is passed to Python via --model-path (slice 01 R19a).
+	// Asset import — only the checkpoint chosen above (modelTag) is mounted; its
+	// path is passed to Python via --model-path.
 	// -----------------------------------------------------------------------
 
 	// importAsset requires a string-literal ID — the builder resolves asset
 	// dependencies statically, so a variable ID is rejected. Select the
-	// checkpoint via if/else over literal imports; only the device tier's asset
+	// checkpoint via if/else over literal imports; only the chosen model's asset
 	// is imported at runtime (R19a).
 	modelAsset := undefined
-	if useGpu {
+	if modelTag == "esm2-650M" {
 		modelAsset = assets.importAsset("@platforma-open/milaboratories.protein-embeddings-assets:esm2-650M")
 	} else {
 		modelAsset = assets.importAsset("@platforma-open/milaboratories.protein-embeddings-assets:esm2-150M")
@@ -265,7 +267,7 @@ wf.body(func(args) {
 	// Request a GPU only when the backend advertises one (slice 01 R21). Gating
 	// on exec.hasGpu is mandatory — .gpuMemory() permanently errors on a GPU-less
 	// backend. cpu()/mem() above are required whenever gpuMemory() is set.
-	if useGpu {
+	if exec.hasGpu {
 		pyBuilder.gpuMemory("16GiB")
 	} else {
 		// CPU tier: let main.py auto-size workers × threads (--workers 0) from the
@@ -308,10 +310,18 @@ wf.body(func(args) {
 		"pl7.app/table/visibility": "default"
 	})
 
+	// Fidelity tier actually used, for the provenance trace. Derived from the
+	// resolved modelTag so "auto" never appears — it has already collapsed to
+	// High (650M) or Low (150M) at plan time above.
+	fidelityLabel := "Low fidelity"
+	if modelTag == "esm2-650M" {
+		fidelityLabel = "High fidelity"
+	}
+
 	trace := pSpec.makeTrace(datasetSpec, {
 		type: "milaboratories.sequence-embeddings",
 		importance: 30,
-		label: "Sequence Embeddings",
+		label: "Sequence Embeddings (" + fidelityLabel + ")",
 		id: blockId
 	})
 

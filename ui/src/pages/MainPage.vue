@@ -1,8 +1,7 @@
 <script setup lang="ts">
 import type {
   AvailableScope,
-  DeviceMode,
-  ModelTag,
+  Fidelity,
   WorkflowStats,
 } from "@platforma-open/milaboratories.sequence-embeddings.model";
 import type { PlRef } from "@platforma-sdk/model";
@@ -18,8 +17,10 @@ import {
   PlLogView,
   PlMaskIcon24,
   PlNumberField,
+  PlRow,
   PlSectionSeparator,
   PlSlideModal,
+  PlSpacer,
 } from "@platforma-sdk/ui-vue";
 import { computed, ref } from "vue";
 import { useApp } from "../app";
@@ -35,10 +36,10 @@ function setInput(ref?: PlRef) {
   app.model.data.inputAnchor = ref;
 }
 
-const deviceOptions: { value: DeviceMode; label: string }[] = [
+const fidelityOptions: { value: Fidelity; label: string }[] = [
   { value: "auto", label: "Auto" },
-  { value: "cpu", label: "CPU" },
-  { value: "gpu", label: "GPU" },
+  { value: "high", label: "High" },
+  { value: "standard", label: "Standard" },
 ];
 
 // Scope multi-select. Options come from the model's input-shape detection
@@ -69,20 +70,6 @@ const showResults = computed(
     hasInput.value && hasScopes.value && !isRunning.value && !!stats.value && !resultsStale.value,
 );
 
-// One-line run header: where it ran, which model, which modality.
-const MODEL_LABELS: Record<ModelTag, string> = {
-  "esm2-650M": "ESM-2 650M",
-  "esm2-150M": "ESM-2 150M",
-};
-const runHeader = computed(() => {
-  const s = stats.value;
-  if (!s) return "";
-  const device = s.device_used === "gpu" ? "GPU" : "CPU";
-  const model = MODEL_LABELS[s.model] ?? s.model;
-  const modality = s.mode === "peptide" ? "Peptide" : "Antibody/TCR";
-  return `Computed on ${device} · ${model} · ${modality}`;
-});
-
 // Map each workflow scope name (feature[_chain]) to the picker label, so the
 // report reads with the same names the user selected (e.g. "Heavy CDR3").
 const scopeLabelByName = computed(() => {
@@ -101,7 +88,7 @@ function scopeLabel(name: string): string {
 // some clonotypes lacked the sequence for that region.
 const reportRows = computed(() =>
   (stats.value?.scopes ?? []).map((s) => {
-    let text = `${s.n_entities.toLocaleString()} embedded`;
+    let text = `${s.n_entities.toLocaleString()} sequences embedded`;
     if (s.n_dropped_empty > 0) {
       const reason = s.feature === "Fv" ? "incomplete pair" : "no sequence";
       text += ` · ${s.n_dropped_empty.toLocaleString()} dropped (${reason})`;
@@ -151,10 +138,16 @@ const totalTruncated = computed(() =>
     </PlDropdownMulti>
 
     <PlAccordionSection label="Advanced Settings">
-      <PlBtnGroup v-model="app.model.data.device" :options="deviceOptions" label="Compute device">
+      <PlBtnGroup
+        v-model="app.model.data.fidelity"
+        :options="fidelityOptions"
+        label="Model fidelity"
+      >
         <template #tooltip>
-          Auto detects a CUDA-capable GPU at workflow time and falls back to CPU if none is found.
-          GPU mode uses ESM-2 650M; CPU mode uses ESM-2 150M to keep inference time reasonable.
+          High uses ESM-2 650M (best quality but slower); Standard uses ESM-2 150M (faster but lower
+          quality). Auto picks 650M when a GPU is available and 150M otherwise. As a rough guide for
+          10k sequences — High: ~1.5 min on GPU, ~70 min on CPU. Standard: ~40 s on GPU, ~15 min on
+          CPU.
         </template>
       </PlBtnGroup>
 
@@ -187,38 +180,35 @@ const totalTruncated = computed(() =>
 
     <!-- Running: live status + access to the streaming progress log, so a long
          CPU run can be watched mid-flight (the log isn't reachable otherwise). -->
-    <div v-if="isRunning" class="results-head">
+    <template v-if="isRunning">
       <PlSectionSeparator compact />
-      <div class="results-header">
-        <div class="run-status">
-          <PlLoaderCircular size="16" />
-          <span>Computing embeddings…</span>
-        </div>
+      <PlRow alignCenter>
+        <PlLoaderCircular size="16" />
+        <span>Computing embeddings…</span>
+        <PlSpacer />
         <PlBtnGhost @click.stop="() => (logOpen = true)">
           Logs
           <template #append>
             <PlMaskIcon24 name="file-logs" />
           </template>
         </PlBtnGhost>
-      </div>
-    </div>
+      </PlRow>
+    </template>
 
     <!-- Run report. -->
     <template v-if="showResults">
-      <!-- Separator bar above a full-size heading; Logs sits on the heading row
-           (the redefine-clonotypes results-header pattern). -->
-      <div class="results-head">
-        <PlSectionSeparator compact />
-        <div class="results-header">
-          <h3 class="results-title">Results</h3>
-          <PlBtnGhost @click.stop="() => (logOpen = true)">
-            Logs
-            <template #append>
-              <PlMaskIcon24 name="file-logs" />
-            </template>
-          </PlBtnGhost>
-        </div>
-      </div>
+      <!-- Separator bar above the heading; Logs sits on the heading row. -->
+      <PlSectionSeparator compact />
+      <PlRow alignCenter>
+        <h3 class="results-title">Results</h3>
+        <PlSpacer />
+        <PlBtnGhost @click.stop="() => (logOpen = true)">
+          Logs
+          <template #append>
+            <PlMaskIcon24 name="file-logs" />
+          </template>
+        </PlBtnGhost>
+      </PlRow>
 
       <!-- Per-scope failures from the Python step. -->
       <PlAlert v-for="err in stats?.errors ?? []" :key="err.scope" type="warn">
@@ -226,10 +216,9 @@ const totalTruncated = computed(() =>
         >: {{ err.error }}
       </PlAlert>
 
-      <!-- Grouped so the run header + per-scope lines read as one tight block
-           rather than as separately gapped children of the page. -->
+      <!-- Per-scope lines kept as one tight block: the SDK's 24px vertical gap
+           would space these out too much. -->
       <div class="results">
-        <div class="results__meta">{{ runHeader }}</div>
         <template v-if="reportRows.length > 0">
           <div v-for="row in reportRows" :key="row.key">
             <strong>{{ row.region }}</strong> — {{ row.text }}
@@ -254,30 +243,12 @@ const totalTruncated = computed(() =>
 </template>
 
 <style scoped>
-.results-head {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.results-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-.results-title {
-  margin: 0;
-}
-.run-status {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
 .results {
   display: flex;
   flex-direction: column;
   gap: 6px;
 }
-.results__meta {
-  color: var(--txt-03, #6b7280);
+.results-title {
+  margin: 0;
 }
 </style>
