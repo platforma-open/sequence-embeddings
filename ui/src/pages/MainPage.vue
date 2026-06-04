@@ -55,7 +55,13 @@ function onScopesChange(ids: string[]) {
   app.model.data.selectedScopes = ids
     .map((id) => opts.find((o) => o.id === id))
     .filter((o): o is AvailableScope => o !== undefined)
-    .map((o) => ({ id: o.id, feature: o.feature, chain: o.chain, columns: o.columns }));
+    .map((o) => ({
+      id: o.id,
+      feature: o.feature,
+      chain: o.chain,
+      columns: o.columns,
+      label: o.label,
+    }));
 }
 
 const hasInput = computed(() => app.model.data.inputAnchor !== undefined);
@@ -210,12 +216,6 @@ const totalTruncated = computed(() =>
         </PlBtnGhost>
       </PlRow>
 
-      <!-- Per-scope failures from the Python step. -->
-      <PlAlert v-for="err in stats?.errors ?? []" :key="err.scope" type="warn">
-        <strong>{{ scopeLabel(err.scope) }}</strong
-        >: {{ err.error }}
-      </PlAlert>
-
       <!-- Per-scope lines kept as one tight block: the SDK's 24px vertical gap
            would space these out too much. -->
       <div class="results">
@@ -224,9 +224,7 @@ const totalTruncated = computed(() =>
             <strong>{{ row.region }}</strong> — {{ row.text }}
           </div>
         </template>
-        <div v-else>
-          No sequences were embedded — check the warnings above and the processing log.
-        </div>
+        <div v-else>No sequences were embedded — check the processing log.</div>
       </div>
 
       <PlAlert v-if="totalTruncated > 0" type="warn">

@@ -3,7 +3,7 @@
 Loads ONE protein language model (the exact checkpoint the workflow chose for
 the runtime device tier and mounted via --model-path), embeds the sequences for
 each requested scope, mean-pools the penultimate-layer hidden states over
-residue positions, and writes a long-format TSV per scope:
+residue positions, and writes a long-format Parquet per scope:
 ``(entity_key, embedding_dim, value)``.
 
 The workflow picks the model by device tier — GPU → ESM-2 650M (fp16),
@@ -18,7 +18,7 @@ I/O contract (with ``workflow/src/main.tpl.tengo``):
   --plan       plan.json   { mode, receptor, device, scopes: [...] }
   --model-path DIR         mounted HF checkpoint dir (the exact model to use)
   --model-name TAG         identity for stats/logs (default: directory name)
-  --output-dir DIR         writes embeddings_{scope.name}.tsv per scope
+  --output-dir DIR         writes embeddings_{scope.name}.parquet per scope
   --stats      stats.json  run metadata + per-scope counts
   --workers    N           CPU inference processes (1=single, default; 0=auto,
                            one per core); ignored on GPU/MPS (R21)
@@ -301,7 +301,11 @@ class Embedder:
             out[i] = vecs[j]
 
     def _forward(self, seqs: list[str]) -> np.ndarray:
-        """Forward + mean-pool, with halve-and-retry on OOM as a safety net."""
+        """Forward + mean-pool, with halve-and-retry on OOM as a safety net.
+
+        The OOM retry is intended for GPU (CUDA) mode: a CPU out-of-memory usually
+        surfaces as a MemoryError or an OS OOM-kill, neither of which this
+        RuntimeError handler catches."""
         import torch
 
         try:
@@ -318,8 +322,6 @@ class Embedder:
     def _forward_once(self, seqs: list[str]) -> np.ndarray:
         import torch
 
-        self.n_truncated += sum(1 for s in seqs if len(s) > self.max_length - 2)
-
         enc = self.tokenizer(
             seqs, return_tensors="pt", padding=True, truncation=True,
             max_length=self.max_length, add_special_tokens=True,
@@ -328,6 +330,12 @@ class Embedder:
 
         with torch.no_grad():
             out = self.model(**enc, output_hidden_states=True)
+
+        # Count truncations only after a successful forward. On OOM, _forward
+        # splits the batch and re-runs each half, calling this method again — so
+        # counting before the model call would double-count the same sequences
+        # across the failed attempt and the retry.
+        self.n_truncated += sum(1 for s in seqs if len(s) > self.max_length - 2)
 
         hidden = out.hidden_states[-2]            # penultimate layer (R9)
         ids = enc["input_ids"]
@@ -450,7 +458,7 @@ class ParallelEmbedder:
 def embed_scope(scope: ScopePlan, df: pl.DataFrame, embedder):
     """Return (matrix, entity_keys, n_dropped). A row is kept only when every
     source column for the scope is present and non-empty (R5); paired-Fv needs
-    both chains. Dropped rows are counted for the R16 annotation."""
+    both chains. Dropped rows are counted."""
     missing = [c for c in scope.source_columns if c not in df.columns]
     if missing:
         return np.zeros((0, 0), dtype=np.float32), [], 0
@@ -473,11 +481,23 @@ def embed_scope(scope: ScopePlan, df: pl.DataFrame, embedder):
     return matrix, entity_keys, n_dropped
 
 
-def write_long_tsv(out_path: Path, matrix: np.ndarray, entity_keys: list[str]) -> None:
-    """Write a long-format TSV: (entity_key, embedding_dim, value), one row per
-    (entity, dim). xsv.importFile builds the two-axis PColumn from this directly
-    (columns.lib.tengo). Built vectorised to stay fast at scale."""
+def write_long_parquet(out_path: Path, matrix: np.ndarray, entity_keys: list[str]) -> None:
+    """Write a long-format Parquet: (entity_key, embedding_dim, value), one row per
+    (entity, dim). xsv.importFile (xsvType "parquet") builds the two-axis PColumn
+    from this directly (columns.lib.tengo). Parquet over TSV avoids the
+    float→text→float round-trip and is columnar/compressed — substantially cheaper
+    to write and to import for the N×D long table. Built vectorised to stay fast
+    at scale.
+
+    A scope with no embeddable rows still writes a header-only (0-row) file. The
+    workflow declares and imports this scope's output unconditionally, so the file
+    must exist even when empty — otherwise the whole run fails on a missing file."""
     n, d = matrix.shape
+    if n == 0 or d == 0:
+        pl.DataFrame(
+            schema={"entity_key": pl.Utf8, "embedding_dim": pl.Int64, "value": pl.Float64}
+        ).write_parquet(out_path)
+        return
     frame = pl.DataFrame(
         {
             "entity_key": np.repeat(np.asarray(entity_keys, dtype=object), d),
@@ -485,7 +505,7 @@ def write_long_tsv(out_path: Path, matrix: np.ndarray, entity_keys: list[str]) -
             "value": matrix.reshape(-1).astype(np.float64),
         }
     )
-    frame.write_csv(out_path, separator="\t")
+    frame.write_parquet(out_path)
 
 
 # --- main -------------------------------------------------------------------
@@ -496,7 +516,7 @@ def main() -> int:
     parser.add_argument("--input", required=True, help="Input TSV path")
     parser.add_argument("--plan", required=True, help="Plan JSON path")
     parser.add_argument("--output-dir", required=True,
-                        help="Directory for per-scope embeddings_{scope.name}.tsv files")
+                        help="Directory for per-scope embeddings_{scope.name}.parquet files")
     parser.add_argument("--stats", required=True, help="Stats JSON path")
     parser.add_argument("--model-path", required=True,
                         help="Mounted HF ESM-2 checkpoint directory — the exact model to use")
@@ -564,7 +584,6 @@ def main() -> int:
         "workers": workers,
         "threads_per_worker": threads_per_worker,
         "scopes": [],
-        "errors": [],
     }
 
     try:
@@ -572,12 +591,14 @@ def main() -> int:
             embedder.n_truncated = 0
             log_message(f"Embedding scope '{scope.name}' (feature={scope.feature}"
                         + (f", chain={scope.chain}" if scope.chain else "") + ")", "STEP")
+            out_path = output_dir / f"embeddings_{scope.name}.parquet"
             try:
                 matrix, entity_keys, n_dropped = embed_scope(scope, df, embedder)
-            except Exception as exc:  # noqa: BLE001 — surface any failure to the workflow via stats
-                log_message(f"scope {scope.name}: {exc!r}", "ERROR")
-                stats["errors"].append({"scope": scope.name, "error": repr(exc)})
-                continue
+            except Exception as exc:
+                # A real embedding failure (model / CUDA / unrecoverable OOM /
+                # unexpected error)
+                log_message(f"scope {scope.name} failed: {exc!r}", "ERROR")
+                raise
 
             entry = {
                 "name": scope.name,
@@ -588,18 +609,17 @@ def main() -> int:
                 "embedding_dim": int(matrix.shape[1]) if len(entity_keys) else 0,
                 "n_dropped_empty": int(n_dropped),
                 "n_truncated": int(embedder.n_truncated),
-                "tsv_file": None,
             }
 
+            # Always write — a header-only file for empty scopes keeps the
+            # workflow's declared/imported output present (see write_long_parquet).
+            write_long_parquet(out_path, matrix, entity_keys)
             if entity_keys:
-                tsv_path = output_dir / f"embeddings_{scope.name}.tsv"
-                write_long_tsv(tsv_path, matrix, entity_keys)
-                entry["tsv_file"] = tsv_path.name
                 log_message(f"scope {scope.name}: {len(entity_keys)} embedded, dim={entry['embedding_dim']}"
                             + (f", {n_dropped} dropped (empty/partial)" if n_dropped else "")
                             + (f", {embedder.n_truncated} truncated >{args.max_length} tokens" if embedder.n_truncated else ""))
             else:
-                log_message(f"scope {scope.name}: no sequences to embed ({n_dropped} dropped)", "WARNING")
+                log_message(f"scope {scope.name}: no sequences to embed ({n_dropped} dropped); wrote empty (header-only) output", "WARNING")
 
             stats["scopes"].append(entry)
     finally:

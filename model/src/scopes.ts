@@ -211,6 +211,7 @@ export function buildScopeConfig(
     feature: s.feature,
     chain: s.chain,
     columns: s.columns,
+    label: s.label,
   });
   return { options: scopes.map(toAvailable), defaults: defaultsInternal.map(toSelected) };
 }

@@ -2,7 +2,7 @@
 //
 // Detects modality from the input anchor axis, collects sequences, runs the
 // Python embedding step (ESM-2 universal), and imports each per-scope output
-// TSV as a two-axis PColumn keyed on (input axis × pl7.app/embeddingDim).
+// Parquet as a two-axis PColumn keyed on (input axis × pl7.app/embeddingDim).
 //
 // Asset usage: model weights live in `support/assets-protein-embeddings/`
 // (esm2-650M, esm2-150M) and are mounted via `assets.importAsset` +
@@ -186,6 +186,7 @@ wf.body(func(args) {
 			name: name,
 			feature: scope.feature,
 			chain: scope.chain,
+			label: scope.label,
 			model: modelTag,
 			receptor: receptor,
 			sourceColumns: srcHeaders
@@ -286,7 +287,7 @@ wf.body(func(args) {
 	// result graph. Builder mutates in place per the 3d-structure-clustering
 	// pattern (clustering.tpl.tengo:115-124) — no rebind needed.
 	for scope in scopes {
-		pyBuilder.saveFile("embeddings/embeddings_" + scope.name + ".tsv")
+		pyBuilder.saveFile("embeddings/embeddings_" + scope.name + ".parquet")
 	}
 
 	pyRun := pyBuilder.
@@ -300,8 +301,8 @@ wf.body(func(args) {
 
 	// -----------------------------------------------------------------------
 	// Per-scope xsv.importFile — one call per scope. Each produces one
-	// two-axis PColumn (entity_key × pl7.app/embeddingDim). The output TSV
-	// path follows Python's contract: `embeddings/embeddings_{scope.name}.tsv`.
+	// two-axis PColumn (entity_key × pl7.app/embeddingDim). The output Parquet
+	// path follows Python's contract: `embeddings/embeddings_{scope.name}.parquet`.
 	// -----------------------------------------------------------------------
 
 	// The input axis should be visible by default in tables — same override
@@ -334,8 +335,8 @@ wf.body(func(args) {
 	pf := pframes.pFrameBuilder()
 	for scope in scopes {
 		colDescriptor := columnSpecs.buildEmbeddingColumn(scope, visibleKeyAxisSpec)
-		scopeTsv := pyRun.getFile("embeddings/embeddings_" + scope.name + ".tsv")
-		imported := xsv.importFile(scopeTsv, "tsv", {
+		scopeFile := pyRun.getFile("embeddings/embeddings_" + scope.name + ".parquet")
+		imported := xsv.importFile(scopeFile, "parquet", {
 			axes: colDescriptor.axes,
 			columns: [colDescriptor.column],
 			storageFormat: "Parquet",

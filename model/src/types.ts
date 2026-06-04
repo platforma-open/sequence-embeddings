@@ -46,10 +46,12 @@ export type SelectedScope = {
   feature: ScopeFeature;
   chain: "A" | "B" | "";
   columns: SUniversalPColumnId[];
+  // Display label, snapshotted from the picker option.
+  label: string;
 };
 
-/** A selectable scope plus its UI label. Returned by the `availableScopes` output. */
-export type AvailableScope = SelectedScope & { label: string };
+/** A selectable scope. Alias of `SelectedScope` — the label lives on the base type. */
+export type AvailableScope = SelectedScope;
 
 /**
  * Scope picker config, computed by the model from the connected input. `options`
@@ -69,9 +71,10 @@ export type ScopeConfig = {
 
 /**
  * Per-scope record in the Python step's `stats.json` output. One entry per
- * scope the workflow asked to compute, regardless of whether the inference
- * succeeded — `n_entities = 0` and `tsv_file = null` mark empty / skipped
- * scopes; `errors[]` (top-level) carries per-scope failures.
+ * scope the workflow successfully processed; a scope whose inference threw is
+ * omitted here and surfaced via `errors[]` instead. `n_entities = 0` marks an
+ * empty scope — a header-only output file is still written for it (the workflow
+ * imports every scope's file by name, so it must exist even when empty).
  */
 export type WorkflowScopeStats = {
   name: string;
@@ -84,7 +87,6 @@ export type WorkflowScopeStats = {
   n_dropped_empty: number;
   /** Sequences truncated from the C-terminus for exceeding the token limit. */
   n_truncated: number;
-  tsv_file: string | null;
 };
 
 /**
@@ -105,7 +107,6 @@ export type WorkflowStats = {
   max_length: number;
   token_budget: number;
   scopes: WorkflowScopeStats[];
-  errors: { scope: string; error: string }[];
 };
 
 /**

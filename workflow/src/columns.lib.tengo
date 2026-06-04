@@ -14,40 +14,11 @@
 // verbatim from the upstream block — slice 01 R2. The embedding-dim axis is
 // always `pl7.app/embeddingDim`, integer-typed.
 //
-// Long-format TSV contract: each per-scope file has columns
+// Long-format Parquet contract: each per-scope file has columns
 // (entity_key, embedding_dim, value); xsv.importFile builds the two-axis
 // PColumn from this directly.
 
 ll := import("@platforma-sdk/workflow-tengo:ll")
-
-// Order priority per scope. Source: pcolumn-spec.md "Order Priority Summary".
-// Higher = further left in the Lead Selection table. 55000 is reserved for the
-// v2 paired αβ SCEPTR column — leave the gap for forward compatibility.
-ORDER_PRIORITY := {
-	"peptide": 60000,
-	"CDR3_A": 58000,
-	"CDR3_B": 57700,
-	"VDJRegion_esm2_A": 57000,
-	"VDJRegion_esm2_B": 56000,
-	"Fv": 54000
-}
-
-// Receptor + chain → human label fragments. Spec R13a: PColumn name and
-// chain domain are unchanged; only the label varies. Mirrors the same helper
-// in sequence-properties — keep in sync if either evolves.
-labelFragments := func(receptor, chain) {
-	if receptor == "TCRAB" {
-		if chain == "A" { return { cdr3: "CDR-α3", fullChain: "Vα" } }
-		if chain == "B" { return { cdr3: "CDR-β3", fullChain: "Vβ" } }
-	}
-	if receptor == "TCRGD" {
-		if chain == "A" { return { cdr3: "CDR-γ3", fullChain: "Vγ" } }
-		if chain == "B" { return { cdr3: "CDR-δ3", fullChain: "Vδ" } }
-	}
-	// IG / unknown — antibody convention.
-	if chain == "A" { return { cdr3: "CDR-H3", fullChain: "VH" } }
-	return { cdr3: "CDR-L3", fullChain: "VL" }
-}
 
 // Embedding-dim axis spec. Same shape for every emitted column — D is encoded
 // in the axis values (0..D-1), not the axis spec itself; downstream consumers
@@ -61,58 +32,29 @@ EMBEDDING_DIM_AXIS := {
 	}
 }
 
-// Build the human-readable label for a scope's column.
+// Build the column label: the native picker label plus an "Embedding" suffix.
 buildLabel := func(scope) {
-	if scope.feature == "peptide" {
-		return "Peptide Embedding"
+	if scope.label == undefined || scope.label == "" {
+		return "Embedding"
 	}
-	if scope.feature == "Fv" {
-		return "Fv Embedding"
-	}
-	if scope.feature == "scFv" {
-		return "scFv Embedding"
-	}
-	frag := labelFragments(scope.receptor, scope.chain)
-	if scope.feature == "CDR3" {
-		return frag.cdr3 + " Embedding"
-	}
-	if scope.feature == "VDJRegion" {
-		return frag.fullChain + " Embedding"
-	}
-	return "Embedding"
-}
-
-// Pick the order priority for a scope. Per pcolumn-spec.md ordering summary.
-// Returns the integer priority; the caller stringifies it for the annotation
-// value (PColumn annotations are string-typed).
-buildOrderPriority := func(scope) {
-	if scope.feature == "peptide" { return ORDER_PRIORITY["peptide"] }
-	if scope.feature == "CDR3" {
-		if scope.chain == "A" { return ORDER_PRIORITY["CDR3_A"] }
-		return ORDER_PRIORITY["CDR3_B"]
-	}
-	if scope.feature == "VDJRegion" {
-		if scope.chain == "A" { return ORDER_PRIORITY["VDJRegion_esm2_A"] }
-		return ORDER_PRIORITY["VDJRegion_esm2_B"]
-	}
-	if scope.feature == "Fv" { return ORDER_PRIORITY["Fv"] }
-	return 50000
+	return scope.label + " Embedding"
 }
 
 // Build the per-scope output column descriptor for xsv.importFile.
 //
 // `scope` shape:
 //   {
-//     name:     string,   // TSV file basename / column id, e.g. "peptide", "CDR3_A"
-//     feature:  string,   // "peptide" | "CDR3" | "VDJRegion" | "Fv"
+//     name:     string,   // Parquet file basename / column id, e.g. "peptide", "CDR3_A"
+//     feature:  string,   // "peptide" | "CDR3" | "VDJRegion" | "Fv" | "scFv"
 //     chain:    string,   // "A" | "B" | "" (peptide or Fv)
+//     label:    string,   // native picker label, e.g. "Heavy CDR3 aa Primary"
 //     model:    string,   // "esm2-650M" | "esm2-150M"
 //     receptor: string    // "IG" | "TCRAB" | "TCRGD" | "" (peptide)
 //   }
 //
 // `keyAxisSpec` is the input axis spec passed through verbatim — slice 01 R2.
 //
-// Returns `{ axes, column }` shaped for xsv.importFile with a long-format TSV
+// Returns `{ axes, column }` shaped for xsv.importFile with a long-format Parquet
 // (columns entity_key, embedding_dim, value). The caller layers blockId and
 // trace onto the resulting spec via `cloneSpec` after xsv.importFile.
 buildEmbeddingColumn := func(scope, keyAxisSpec) {
@@ -143,8 +85,7 @@ buildEmbeddingColumn := func(scope, keyAxisSpec) {
 				annotations: {
 					"pl7.app/label": buildLabel(scope),
 					"pl7.app/format": ".6f",
-					"pl7.app/table/visibility": "hidden",
-					"pl7.app/table/orderPriority": string(buildOrderPriority(scope))
+					"pl7.app/table/visibility": "hidden"
 				}
 			}
 		}
