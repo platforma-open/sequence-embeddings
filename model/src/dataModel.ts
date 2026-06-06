@@ -1,7 +1,7 @@
 import { DataModelBuilder } from "@platforma-sdk/model";
 import type { BlockDataV1 } from "./types";
 
-const DEFAULT_FIDELITY = "auto" as const;
+const DEFAULT_FIDELITY = "standard" as const;
 
 export const blockDataModel = new DataModelBuilder()
   .from<BlockDataV1>("Ver_2026_05_29")

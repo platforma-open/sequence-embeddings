@@ -1,0 +1,78 @@
+// Compute-embeddings subtemplate — runs the Python ESM-2 embedding exec and
+// exposes its per-scope Parquet outputs + stats + processing log.
+//
+// The caller (main.tpl.tengo) imports the Parquet outputs and assembles the pframe.
+
+self := import("@platforma-sdk/workflow-tengo:tpl")
+exec := import("@platforma-sdk/workflow-tengo:exec")
+assets := import("@platforma-sdk/workflow-tengo:assets")
+
+json := import("json")
+
+soft := assets.importSoftware("@platforma-open/milaboratories.sequence-embeddings.software:compute-embeddings")
+
+self.validateInputs({
+	"__options__,closed": "",
+	inputTsv: "any",            // sequences TSV (entity_key + per-scope seqN columns)
+	planJson: "any",            // canonical-encoded plan { device, scopes }
+	modelTag: "string",         // checkpoint to import/mount + --model-name identity
+	"cpu,?": "number",          // metaInput — scheduling only, NOT in the content-ID
+	"mem,?": "number"           // metaInput (GiB) — scheduling only, NOT in the content-ID
+})
+
+self.defineOutputs("embeddings", "stats", "processingLog")
+
+self.body(func(inputs) {
+	plan := json.decode(inputs.planJson)
+	cpu := is_undefined(inputs.cpu) ? 16 : inputs.cpu
+	memGiB := is_undefined(inputs.mem) ? 32 : inputs.mem
+
+	// Mount the checkpoint chosen by the caller.
+	modelAsset := undefined
+	if inputs.modelTag == "esm2-650M" {
+		modelAsset = assets.importAsset("@platforma-open/milaboratories.protein-embeddings-assets:esm2-650M")
+	} else {
+		modelAsset = assets.importAsset("@platforma-open/milaboratories.protein-embeddings-assets:esm2-150M")
+	}
+
+	pyBuilder := exec.builder().
+		software(soft).
+		mem(string(memGiB) + "GiB").
+		cpu(cpu).
+		addAsset(modelAsset, "model").
+		addFile("input.tsv", inputs.inputTsv).
+		writeFile("plan.json", inputs.planJson).
+		arg("--input").arg("input.tsv").
+		arg("--plan").arg("plan.json").
+		arg("--output-dir").arg("embeddings").
+		arg("--stats").arg("stats.json").
+		arg("--model-path").arg("model").
+		arg("--model-name").arg(inputs.modelTag).
+		arg("--max-memory-gb").argExpr("{system.ram.gb}").
+		mkDir("embeddings")
+
+	// GPU vs CPU tier is decided by plan.device 
+	if plan.device == "gpu" {
+		pyBuilder.gpuMemory("16GiB")
+	} else {
+		pyBuilder.
+			arg("--workers").arg("0").
+			arg("--cpus").argExpr("{system.cpu}")
+	}
+
+	// All per-scope Parquets captured as ONE file set: defineOutputs is declared
+	// at load time, so we can't name one output per (dynamic) scope. The set map
+	// is keyed by the workdir-relative path (save.tpl.tengo); the caller pulls
+	// each scope's file out by "embeddings/embeddings_{scope.name}.parquet".
+	pyRun := pyBuilder.
+		saveFileSet("embeddings", "^embeddings/embeddings_.*\\.parquet$").
+		saveFileContent("stats.json").
+		saveStdoutStream().
+		run()
+
+	return {
+		embeddings: pyRun.getFileSet("embeddings"),
+		stats: pyRun.getFileContent("stats.json"),
+		processingLog: pyRun.getStdoutStream()
+	}
+})

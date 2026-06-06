@@ -29,18 +29,24 @@ const app = useApp();
 
 const logOpen = ref(false);
 
-// Setter, not a watch on `inputAnchor` — see sequence-properties for the
-// reasoning. A watcher would fire on server-patch object replacements (other
-// client edits, app reopen) and reset state the user did not touch.
+// Setter, not a watch on `inputAnchor`. A watcher would fire on server-patch
+// object replacements (other client edits, app reopen) and reset state the user
+// did not touch.
 function setInput(ref?: PlRef) {
   app.model.data.inputAnchor = ref;
 }
 
 const fidelityOptions: { value: Fidelity; label: string }[] = [
-  { value: "auto", label: "Auto" },
-  { value: "high", label: "High" },
   { value: "standard", label: "Standard" },
+  { value: "high", label: "High" },
 ];
+
+// Warn when High fidelity (ESM-2 650M) is picked on a backend without a GPU
+// `gpuAvailable` comes from the prerun (exec.hasGpu); undefined while it
+// resolves, so only warn on an explicit `false`.
+const highFidelityNoGpu = computed(
+  () => app.model.data.fidelity === "high" && app.model.outputs.gpuAvailable === false,
+);
 
 // Scope multi-select. Options come from the model's input-shape detection
 // (availableScopes). The picker tracks scope ids; on change we snapshot the full
@@ -76,20 +82,6 @@ const showResults = computed(
     hasInput.value && hasScopes.value && !isRunning.value && !!stats.value && !resultsStale.value,
 );
 
-// Map each workflow scope name (feature[_chain]) to the picker label, so the
-// report reads with the same names the user selected (e.g. "Heavy CDR3").
-const scopeLabelByName = computed(() => {
-  const m = new Map<string, string>();
-  for (const o of app.model.outputs.availableScopes?.options ?? []) {
-    const name = o.chain ? `${o.feature}_${o.chain}` : o.feature;
-    m.set(name, o.label);
-  }
-  return m;
-});
-function scopeLabel(name: string): string {
-  return scopeLabelByName.value.get(name) ?? name;
-}
-
 // One line per computed scope: embedded count, plus dropped (+ reason) only when
 // some clonotypes lacked the sequence for that region.
 const reportRows = computed(() =>
@@ -99,7 +91,7 @@ const reportRows = computed(() =>
       const reason = s.feature === "Fv" ? "incomplete pair" : "no sequence";
       text += ` · ${s.n_dropped_empty.toLocaleString()} dropped (${reason})`;
     }
-    return { key: s.name, region: scopeLabel(s.name), text };
+    return { key: s.name, region: s.label || s.name, text };
   }),
 );
 
@@ -108,6 +100,10 @@ const reportRows = computed(() =>
 const totalTruncated = computed(() =>
   (stats.value?.scopes ?? []).reduce((acc, s) => acc + (s.n_truncated ?? 0), 0),
 );
+
+// The model's length cap in amino acids = its token limit (stats.max_length) minus
+// the 2 special tokens (<cls>/<eos>). Shown in the truncation warning.
+const maxResidues = computed(() => (stats.value?.max_length ?? 1024) - 2);
 </script>
 
 <template>
@@ -143,20 +139,25 @@ const totalTruncated = computed(() =>
       </template>
     </PlDropdownMulti>
 
-    <PlAccordionSection label="Advanced Settings">
-      <PlBtnGroup
-        v-model="app.model.data.fidelity"
-        :options="fidelityOptions"
-        label="Model fidelity"
-      >
-        <template #tooltip>
-          High uses ESM-2 650M (best quality but slower); Standard uses ESM-2 150M (faster but lower
-          quality). Auto picks 650M when a GPU is available and 150M otherwise. As a rough guide for
-          10k sequences — High: ~1.5 min on GPU, ~70 min on CPU. Standard: ~40 s on GPU, ~15 min on
-          CPU.
-        </template>
-      </PlBtnGroup>
+    <PlBtnGroup v-model="app.model.data.fidelity" :options="fidelityOptions" label="Model fidelity">
+      <template #tooltip>
+        Standard uses ESM-2 150M (faster, lower quality); High uses ESM-2 650M (best quality,
+        slower). As a rough guide for 10k sequences — Standard: ~40 s on GPU, ~15 min on CPU; High:
+        ~1.5 min on GPU, ~70 min on CPU.
+      </template>
+    </PlBtnGroup>
 
+    <!-- High fidelity needs a GPU to be fast; warn when none is available (CPU fallback is slow). -->
+    <PlAlert v-if="highFidelityNoGpu" type="warn">
+      <strong>High fidelity will be slow on this machine — it has no GPU.</strong>
+      It will run on the CPU instead, taking roughly
+      <strong>70 minutes per 10,000 sequences</strong> (Standard takes about 15 minutes). For faster
+      results, switch to <strong>Standard</strong> — only slightly lower quality. Keep
+      <strong>High</strong> only if you need the best accuracy and can wait, or run the block on a
+      machine that has a GPU.
+    </PlAlert>
+
+    <PlAccordionSection label="Advanced Settings">
       <PlSectionSeparator>Resource Allocation</PlSectionSeparator>
       <PlNumberField
         v-model="app.model.data.mem"
@@ -228,8 +229,8 @@ const totalTruncated = computed(() =>
       </div>
 
       <PlAlert v-if="totalTruncated > 0" type="warn">
-        {{ totalTruncated.toLocaleString() }} sequence(s) exceeded the model's length limit and were
-        truncated before embedding.
+        {{ totalTruncated.toLocaleString() }} sequence(s) exceeded the model's
+        {{ maxResidues.toLocaleString() }}-amino-acid limit and were truncated before embedding.
       </PlAlert>
     </template>
   </PlBlockPage>

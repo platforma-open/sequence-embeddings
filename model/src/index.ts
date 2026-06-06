@@ -15,16 +15,15 @@ export type {
   ScopeConfig,
   ScopeFeature,
   SelectedScope,
-  WorkflowMode,
   WorkflowReceptor,
   WorkflowScopeStats,
   WorkflowStats,
 } from "./types";
 
 /**
- * Input-anchor shape filters for the dataset dropdown. Mirrors the four
- * recognised axis patterns from the workflow's `detectMode` so the user sees
- * only datasets the block can actually consume:
+ * Input-anchor shape filters for the dataset dropdown. Mirrors the recognised
+ * entity-key axis patterns the workflow accepts (see `isKeyAxis`) so the user
+ * sees only datasets the block can actually consume:
  *  - Peptide mode (universal naming): `[pl7.app/sampleId, pl7.app/variantKey]`
  *    with the peptide extractionRunId domain on the variant key.
  *  - Antibody/TCR (legacy MiXCR bulk): `[pl7.app/sampleId, pl7.app/vdj/cloneId]`
@@ -59,7 +58,7 @@ export const platforma = BlockModelV3.create(blockDataModel)
       throw new Error("Select an input dataset");
     }
     if (data.selectedScopes.length === 0) {
-      throw new Error("Select at least one scope to embed"); // R6b
+      throw new Error("Select at least one scope to embed");
     }
     return {
       inputAnchor: data.inputAnchor,
@@ -71,6 +70,9 @@ export const platforma = BlockModelV3.create(blockDataModel)
       cpu: data.cpu,
     };
   })
+  // Prerun feeds a lightweight always-rerun template that reports whether the
+  // backend advertises a GPU
+  .prerunArgs(() => ({}))
   // Dropdown source for the input picker. Refs returned here populate the UI
   // selector; the user's pick is written back into `data.inputAnchor`.
   .output("inputOptions", (ctx) => ctx.resultPool.getOptions(inputAnchorSpecs))
@@ -81,7 +83,7 @@ export const platforma = BlockModelV3.create(blockDataModel)
   )
   // Scope picker config — derived from the connected input's sequence columns.
   // `options` feeds the multi-select; `defaults` is the first-connection
-  // selection (Default Selection Rule). The UI snapshots a chosen scope's
+  // selection. The UI snapshots a chosen scope's
   // column id(s) into `data.selectedScopes` so the args lambda stays data-only.
   // retentive: avoid the picker flickering empty while the pool re-resolves.
   .output(
@@ -98,10 +100,9 @@ export const platforma = BlockModelV3.create(blockDataModel)
         .addAxisLabelProvider(ctx.resultPool)
         .getUniversalEntries(SEQUENCE_SELECTORS, { anchorCtx });
       if (entries === undefined) return undefined;
-      // Native sequence labels, derived exactly as clonotype-clustering does, so
-      // per-sequence scopes show the same labels users see there. Keyed by the
-      // same SUniversalPColumnId as the universal entries (both go through the
-      // same anchorCtx). The synthetic Paired Fv option gets this block's label.
+      // Native sequence labels. Keyed by the same SUniversalPColumnId as the
+      // universal entries (both go through the same anchorCtx).
+      // The synthetic Paired Fv option gets this block's label.
       const labeled = ctx.resultPool.getCanonicalOptions({ main: ref }, SEQUENCE_SELECTORS, {
         ignoreMissingDomains: true,
         labelOps: { includeNativeLabel: true },
@@ -132,6 +133,12 @@ export const platforma = BlockModelV3.create(blockDataModel)
     if (ctx.args === undefined || ctx.activeArgs === undefined) return false;
     return JSON.stringify(ctx.args) !== JSON.stringify(ctx.activeArgs);
   })
+  // Backend GPU-availability flag from the prerun
+  .output("gpuAvailable", (ctx): boolean | undefined =>
+    ctx.prerun
+      ?.resolve({ field: "gpuAvailable", assertFieldType: "Input", allowPermanentAbsence: true })
+      ?.getDataAsJson<boolean>(),
+  )
   // Workflow stderr — surfaced as a log viewer in the UI for diagnostics.
   .output("processingLog", (ctx) => ctx.outputs?.resolve("processingLog")?.getLogHandle())
   .title(() => "Sequence Embeddings")

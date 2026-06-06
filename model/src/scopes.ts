@@ -7,11 +7,9 @@
  * resolvable and storable) and calls `buildScopeConfig` to turn them into the
  * `availableScopes` picker config.
  *
- * Mirrors `sequence-properties` for receptor resolution (SD-008) and chain
- * conventions. Unlike that block, scopes here map to whole sequence columns:
- * each single-chain scope is one column; the paired Fv scope is the two
+ * Each single-chain scope is one column; the paired Fv scope is the two
  * per-chain VDJRegion column ids (`[VH, VL]`), embedded separately and vector-
- * concatenated by the Python step (R10).
+ * concatenated by the Python step.
  *
  * VDJRegion/Fv are offered only when a native VDJRegion column is present
  * (MiXCR assembled on VDJRegion). CDR3-assembled inputs expose CDR3 only — a
@@ -31,7 +29,7 @@ export type SeqEntry = { id: SUniversalPColumnId; spec: PColumnSpec };
 /**
  * Selectors for candidate sequence columns under the `main` anchor's key axis.
  * Peptide inputs match only the first; antibody/TCR inputs match the VDJ ones.
- * Filtered on amino-acid alphabet — embeddings read AA sequence (R4, R5).
+ * Filtered on amino-acid alphabet — embeddings read AA sequence.
  */
 export const SEQUENCE_SELECTORS: AnchoredPColumnSelector[] = [
   {
@@ -51,7 +49,7 @@ export const SEQUENCE_SELECTORS: AnchoredPColumnSelector[] = [
   },
 ];
 
-/** Bulk MiXCR chain enum → receptor (SD-008). Mirrors sequence-properties. */
+/** Bulk MiXCR chain enum → receptor. Mirrors sequence-properties. */
 const CHAIN_TO_RECEPTOR: Record<string, WorkflowReceptor> = {
   IGHeavy: "IG",
   IGLight: "IG",
@@ -65,7 +63,7 @@ const CHAIN_TO_RECEPTOR: Record<string, WorkflowReceptor> = {
 
 /**
  * Resolve receptor from a domain record: explicit `pl7.app/vdj/receptor` wins,
- * then derive from `pl7.app/vdj/chain` (SD-008), else default IG (R3).
+ * then derive from `pl7.app/vdj/chain`, else default IG.
  */
 export function resolveReceptor(domain: Record<string, string> | undefined): WorkflowReceptor {
   const r = domain?.["pl7.app/vdj/receptor"];
@@ -84,9 +82,8 @@ function isAssembling(spec: PColumnSpec): boolean {
 /**
  * Build the scope picker config (options + first-connection defaults) from the
  * discovered sequence columns and the resolved receptor. `labels` maps each
- * column id to its native label (derived exactly as `clonotype-clustering`
- * does), so per-sequence scopes show the same labels users see there; the
- * synthetic Paired Fv option uses this block's own label.
+ * column id to its native label. The synthetic Paired Fv option uses this
+ * block's own label.
  */
 export function buildScopeConfig(
   entries: SeqEntry[],
@@ -127,7 +124,7 @@ export function buildScopeConfig(
       continue;
     }
     if (name === "pl7.app/vdj/sequence") {
-      // Keep primary allele only — secondary alleles would duplicate a chain (SD-001).
+      // Keep primary allele only — secondary alleles would duplicate a chain.
       const alleleIdx = d["pl7.app/vdj/scClonotypeChain/index"];
       if (alleleIdx !== undefined && alleleIdx !== "primary") continue;
 
@@ -168,7 +165,7 @@ export function buildScopeConfig(
       if (scopes[i].feature === "VDJRegion") scopes.splice(i, 1);
     }
   } else {
-    // Paired Fv — IG only, both heavy + light VDJRegion present (R7, R10).
+    // Paired Fv — IG only, both heavy + light VDJRegion present.
     fvAvailable = receptor === "IG" && vdjByChain.A !== undefined && vdjByChain.B !== undefined;
     if (fvAvailable) {
       scopes.push({
@@ -182,15 +179,15 @@ export function buildScopeConfig(
     }
   }
 
-  // Default Selection Rule (R6).
+  // First-connection defaults.
   let defaultsInternal: Internal[];
   if (scFvPresent) {
     defaultsInternal = scopes.filter((s) => s.feature === "scFv"); // scFv construct is the default
   } else if (fvAvailable) {
-    defaultsInternal = scopes.filter((s) => s.feature === "Fv"); // rule 1
+    defaultsInternal = scopes.filter((s) => s.feature === "Fv"); // prefer paired Fv
   } else {
-    defaultsInternal = scopes.filter((s) => s.assembling); // rule 3 — assembly-trusted columns
-    // rule 4 — same-chain CDR3+VDJRegion → keep VDJRegion, drop the redundant CDR3.
+    defaultsInternal = scopes.filter((s) => s.assembling); // assembly-trusted columns
+    // same-chain CDR3+VDJRegion → keep VDJRegion, drop the redundant CDR3.
     const vdjChains = new Set(
       defaultsInternal.filter((s) => s.feature === "VDJRegion").map((s) => s.chain),
     );
