@@ -213,7 +213,7 @@ wf.body(func(args) {
 
 	// Fidelity tier actually used, for the provenance trace. Derived from the
 	// resolved modelTag
-	fidelityLabel := "Low fidelity"
+	fidelityLabel := "Standard fidelity"
 	if modelTag == "esm2-650M" {
 		fidelityLabel = "High fidelity"
 	}

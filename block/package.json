@@ -28,7 +28,7 @@
       "logo": "file:../logos/block-logo.png",
       "url": "https://github.com/platforma-open/milaboratories.sequence-embeddings",
       "support": "mailto:support@milaboratories.com",
-      "description": "Per-sequence vector embeddings for peptide and antibody/TCR datasets via ESM-2 (universal protein language model, 650M on GPU / 150M on CPU).",
+      "description": "Per-sequence vector embeddings for peptide and antibody/TCR datasets via ESM-2 (universal protein language model).",
       "longDescription": "file:../docs/description.md",
       "changelog": "file:../CHANGELOG.md",
       "tags": ["airr", "downstream", "peptide", "embeddings"],
