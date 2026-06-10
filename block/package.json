@@ -26,7 +26,7 @@
     "meta": {
       "title": "Sequence Embeddings",
       "logo": "file:../logos/block-logo.png",
-      "url": "https://github.com/platforma-open/milaboratories.sequence-embeddings",
+      "url": "https://github.com/platforma-open/sequence-embeddings",
       "support": "mailto:support@milaboratories.com",
       "description": "Per-sequence vector embeddings for peptide and antibody/TCR datasets via ESM-2 (universal protein language model).",
       "longDescription": "file:../docs/description.md",
