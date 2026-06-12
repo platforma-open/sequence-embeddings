@@ -17,7 +17,7 @@ export type {
   SelectedScope,
   WorkflowReceptor,
   WorkflowScopeStats,
-  WorkflowStats,
+  WorkflowStats
 } from "./types";
 
 /**
@@ -98,21 +98,17 @@ export const platforma = BlockModelV3.create(blockDataModel)
       const entries = new PColumnCollection()
         .addColumnProvider(ctx.resultPool)
         .addAxisLabelProvider(ctx.resultPool)
-        .getUniversalEntries(SEQUENCE_SELECTORS, { anchorCtx });
+        .getUniversalEntries(SEQUENCE_SELECTORS, {
+          anchorCtx,
+          labelOps: { includeNativeLabel: true },
+        });
       if (entries === undefined) return undefined;
-      // Native sequence labels. Keyed by the same SUniversalPColumnId as the
-      // universal entries (both go through the same anchorCtx).
-      // The synthetic Paired Fv option gets this block's label.
-      const labeled = ctx.resultPool.getCanonicalOptions({ main: ref }, SEQUENCE_SELECTORS, {
-        ignoreMissingDomains: true,
-        labelOps: { includeNativeLabel: true },
-      });
-      const labelById = new Map<string, string>((labeled ?? []).map((o) => [o.value, o.label]));
       return {
+        // Native columns carry the label derived above; the synthetic Paired Fv
+        // option gets this block's own label (set in buildScopeConfig).
         ...buildScopeConfig(
-          entries.map((e) => ({ id: e.id, spec: e.spec })),
+          entries.map((e) => ({ id: e.id, spec: e.spec, label: e.label })),
           receptor,
-          labelById,
         ),
         // Stamp the anchor this config belongs to, so the UI seed watcher can
         // reject a retained (stale) config from the previous input.

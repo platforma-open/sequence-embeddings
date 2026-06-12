@@ -2,9 +2,10 @@
  * Scope detection for the embedding picker (model side).
  *
  * Pure functions over the sequence columns discovered under the input anchor.
- * `index.ts` fetches the columns (`getUniversalEntries({ anchorCtx })`, which
- * yields `{ id: SUniversalPColumnId, spec }` pairs — the id is workflow-
- * resolvable and storable) and calls `buildScopeConfig` to turn them into the
+ * `index.ts` fetches the columns (`getUniversalEntries` with
+ * `labelOps.includeNativeLabel`, which yields `{ id, spec, label }` entries — the
+ * id is workflow-resolvable and storable, the label is the column's own native
+ * label) and calls `buildScopeConfig` to turn them into the
  * `availableScopes` picker config.
  *
  * Each single-chain scope is one column; the paired Fv scope is the two
@@ -23,8 +24,9 @@ import type {
 } from "@platforma-sdk/model";
 import type { AvailableScope, ScopeConfig, SelectedScope, WorkflowReceptor } from "./types";
 
-/** A discovered sequence column: its workflow-resolvable id plus its spec. */
-export type SeqEntry = { id: SUniversalPColumnId; spec: PColumnSpec };
+/** A discovered sequence column: its workflow-resolvable id, spec, and the
+ *  label derived for it (native label forced via includeNativeLabel upstream). */
+export type SeqEntry = { id: SUniversalPColumnId; spec: PColumnSpec; label: string };
 
 /**
  * Selectors for candidate sequence columns under the `main` anchor's key axis.
@@ -81,14 +83,13 @@ function isAssembling(spec: PColumnSpec): boolean {
 
 /**
  * Build the scope picker config (options + first-connection defaults) from the
- * discovered sequence columns and the resolved receptor. `labels` maps each
- * column id to its native label. The synthetic Paired Fv option uses this
+ * discovered sequence columns and the resolved receptor. Each entry carries its
+ * own derived `label` (taken verbatim); the synthetic Paired Fv option uses this
  * block's own label.
  */
 export function buildScopeConfig(
   entries: SeqEntry[],
   receptor: WorkflowReceptor,
-  labels: Map<string, string>,
 ): Omit<ScopeConfig, "forAnchor"> {
   type Internal = AvailableScope & { assembling: boolean };
   const scopes: Internal[] = [];
@@ -106,7 +107,7 @@ export function buildScopeConfig(
         feature: "peptide",
         chain: "",
         columns: [e.id],
-        label: labels.get(e.id) ?? "Peptide",
+        label: e.label,
         assembling,
       });
       continue;
@@ -118,7 +119,7 @@ export function buildScopeConfig(
         feature: "scFv",
         chain: "",
         columns: [e.id],
-        label: labels.get(e.id) ?? "scFv",
+        label: e.label,
         assembling,
       });
       continue;
@@ -138,7 +139,7 @@ export function buildScopeConfig(
           feature: "CDR3",
           chain,
           columns: [e.id],
-          label: labels.get(e.id) ?? "CDR3",
+          label: e.label,
           assembling,
         });
       } else if (feat === "VDJRegion") {
@@ -147,7 +148,7 @@ export function buildScopeConfig(
           feature: "VDJRegion",
           chain,
           columns: [e.id],
-          label: labels.get(e.id) ?? "VDJRegion",
+          label: e.label,
           assembling,
         });
         if (chain === "A" || chain === "B") vdjByChain[chain] = e.id;
