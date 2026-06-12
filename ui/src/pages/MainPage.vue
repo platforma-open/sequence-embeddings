@@ -76,6 +76,11 @@ const isRunning = computed(() => app.model.outputs.isRunning === true);
 const stats = computed<WorkflowStats | undefined>(() => app.model.outputs.stats);
 const resultsStale = computed(() => app.model.outputs.resultsStale === true);
 
+// A run has produced (or is producing) outputs once the processing-log handle
+// exists — true throughout running, the finishing gap, and the results state, but
+// not before the first run. Gates the persistent status/results header.
+const hasRunOutputs = computed(() => app.model.outputs.processingLog !== undefined);
+
 // Report is shown once a run matching the current settings has completed.
 const showResults = computed(
   () =>
@@ -185,13 +190,16 @@ const maxResidues = computed(() => (stats.value?.max_length ?? 1024) - 2);
       Settings changed — press <strong>Run</strong> to update the results.
     </PlAlert>
 
-    <!-- Running: live status + access to the streaming progress log, so a long
-         CPU run can be watched mid-flight (the log isn't reachable otherwise). -->
-    <template v-if="isRunning">
+    <!-- Persistent status/results header. Stays mounted from run start through to
+         the report so the Logs button (and its row) never unmount. -->
+    <template v-if="hasRunOutputs">
       <PlSectionSeparator compact />
       <PlRow alignCenter>
-        <PlLoaderCircular size="16" />
-        <span>Computing embeddings…</span>
+        <template v-if="isRunning">
+          <PlLoaderCircular size="16" />
+          <span>Computing embeddings…</span>
+        </template>
+        <h3 v-else-if="showResults" class="results-title">Results</h3>
         <PlSpacer />
         <PlBtnGhost @click.stop="() => (logOpen = true)">
           Logs
@@ -204,19 +212,6 @@ const maxResidues = computed(() => (stats.value?.max_length ?? 1024) - 2);
 
     <!-- Run report. -->
     <template v-if="showResults">
-      <!-- Separator bar above the heading; Logs sits on the heading row. -->
-      <PlSectionSeparator compact />
-      <PlRow alignCenter>
-        <h3 class="results-title">Results</h3>
-        <PlSpacer />
-        <PlBtnGhost @click.stop="() => (logOpen = true)">
-          Logs
-          <template #append>
-            <PlMaskIcon24 name="file-logs" />
-          </template>
-        </PlBtnGhost>
-      </PlRow>
-
       <!-- Per-scope lines kept as one tight block: the SDK's 24px vertical gap
            would space these out too much. -->
       <div class="results">

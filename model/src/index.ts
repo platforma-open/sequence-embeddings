@@ -17,7 +17,7 @@ export type {
   SelectedScope,
   WorkflowReceptor,
   WorkflowScopeStats,
-  WorkflowStats
+  WorkflowStats,
 } from "./types";
 
 /**
