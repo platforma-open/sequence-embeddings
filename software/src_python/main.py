@@ -665,12 +665,15 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
             "n_dropped_empty": n_drop,
             "n_truncated": n_trunc,
         })
+        # Log the human-readable picker label (e.g. "Paired Fv", "Heavy
+        # VDJRegionInFrame aa") rather than the filename-safe scope name
+        disp = sc.label or sc.name
         if n_ent:
-            log_message(f"scope {sc.name}: {n_ent} embedded, dim={out_dim[sc.name]}"
+            log_message(f"scope {disp}: {n_ent} embedded, dim={out_dim[sc.name]}"
                         + (f", {n_drop} dropped (empty/partial)" if n_drop else "")
                         + (f", {n_trunc} truncated >{embedder.max_length} tokens" if n_trunc else ""))
         else:
-            log_message(f"scope {sc.name}: no sequences to embed ({n_drop} dropped); "
+            log_message(f"scope {disp}: no sequences to embed ({n_drop} dropped); "
                         "wrote empty (header-only) output", "WARNING")
     return entries
 

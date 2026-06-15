@@ -8,6 +8,7 @@
     "check": "turbo run check",
     "build": "turbo run build",
     "build:dev": "env PL_PKG_DEV=local turbo run build",
+    "build:dev-remote": "env PL_PKG_DEV=local PL_DOCKER_BUILD=1 PL_DOCKER_AUTOPUSH=1 turbo run build",
     "test": "env PL_PKG_DEV=local turbo run test --concurrency 1 --env-mode=loose",
     "test:dry-run": "env PL_PKG_DEV=local turbo run test --dry-run=json",
     "mark-stable": "turbo run mark-stable",
