@@ -4,7 +4,7 @@ Turns antibody, TCR, and peptide sequences into numerical vectors — *embedding
 
 The block reads peptide datasets (from Peptide Profiling) or antibody/TCR clonotypes (from MiXCR Clonotyping or Import V(D)J Data, bulk or single-cell). You choose which region to embed: the **full peptide**; the **CDR3** per chain; the **full variable domain** per chain; the **paired Fv** (heavy and light chains together, antibody only); or the **scFv** construct (the full VH–linker–VL polypeptide). Full-domain and Fv options require a fully assembled variable domain. When the input carries only CDR3, only the CDR3 option is offered.
 
-You choose the **model fidelity** — *Standard* (ESM-2 150M: faster, lower quality) or *High* (ESM-2 650M: best quality, slower). The block uses a GPU automatically when one is available; High fidelity is much faster on a GPU, so on a CPU-only machine with many sequences Standard fidelity is the best choice.
+You choose the **model fidelity** — *Standard* (ESM-2 150M: faster, standard quality) or *High* (ESM-2 650M: high quality, slower). The block uses a GPU automatically when one is available; High fidelity is much faster on a GPU, so on a CPU-only machine with many sequences Standard fidelity is the best choice.
 
 The embeddings are available for **Sequence Clustering** and **Sequence Space** for similarity grouping and visualization.
 

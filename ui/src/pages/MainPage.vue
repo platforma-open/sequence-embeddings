@@ -129,7 +129,7 @@ const hasInput = computed(() => app.model.data.inputAnchor !== undefined);
 
     <PlBtnGroup v-model="app.model.data.fidelity" :options="fidelityOptions" label="Model fidelity">
       <template #tooltip>
-        Standard uses ESM-2 150M (faster, lower quality); High uses ESM-2 650M (best quality,
+        Standard uses ESM-2 150M (faster, standard quality); High uses ESM-2 650M (high quality,
         slower). As a rough guide for 10k sequences — Standard: ~40 s on GPU, ~15 min on CPU; High:
         ~1.5 min on GPU, ~70 min on CPU.
       </template>
@@ -140,9 +140,8 @@ const hasInput = computed(() => app.model.data.inputAnchor !== undefined);
       <strong>High fidelity will be slow on this machine — it has no GPU.</strong>
       It will run on the CPU instead, taking roughly
       <strong>70 minutes per 10,000 sequences</strong> (Standard takes about 15 minutes). For faster
-      results, switch to <strong>Standard</strong> — only slightly lower quality. Keep
-      <strong>High</strong> only if you need the best accuracy and can wait, or run the block on a
-      machine that has a GPU.
+      results, switch to <strong>Standard</strong>. Keep <strong>High</strong> only if you need the
+      best accuracy and can wait, or run the block on a machine that has a GPU.
     </PlAlert>
 
     <PlAccordionSection label="Advanced Settings">
