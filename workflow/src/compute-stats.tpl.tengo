@@ -1,0 +1,96 @@
+// compute-stats — run-report counting pass.
+//
+// Owns the whole counting computation: builds the full-source TSV from the passed
+// source columns, assembles the all-scope plan, and runs the embeddings Python
+// software in --stats-only mode (no model load, no embedding) to count per-scope
+// n_entities / n_dropped / n_truncated (reusing the embedding step's scope_stats)
+// plus device / model / max_length. Output is `stats` (the stats.json content).
+//
+// Rendered as a PURE template (render.create) so it is content-addressed by
+// (source column data × scope metadata × keyAxis × device × model): the same data
+// + selection dedups across re-runs and projects. The scope metadata uses seqN
+// header indices and feature/chain/label (NOT anchor-specific column ids), so the
+// content ID stays project-independent. cpu/mem ride as metaInputs (scheduling
+// only — NOT in the content ID).
+
+self := import("@platforma-sdk/workflow-tengo:tpl")
+exec := import("@platforma-sdk/workflow-tengo:exec")
+assets := import("@platforma-sdk/workflow-tengo:assets")
+pframes := import("@platforma-sdk/workflow-tengo:pframes")
+canonical := import("@platforma-sdk/workflow-tengo:canonical")
+
+soft := assets.importSoftware("@platforma-open/milaboratories.sequence-embeddings.software:compute-embeddings")
+
+self.validateInputs({
+	"__options__,closed": "",
+	cols: "any",            // MAP: header -> source column {spec,data}. Columns ride in a
+	                        // map, not an array — render rejects arrays that contain references.
+	scopes: "any",          // [{ name, feature, chain, label, sourceColumns: [header] }] (ref-free)
+	keyAxisSpec: "any",     // entity-key axis spec (for the TSV axis header)
+	keyCol: "string",       // entity-key column header (= batch-key axis name)
+	device: "string",       // "cpu" | "gpu" (recorded in the report)
+	modelTag: "string",     // model identity echoed into the report
+	"cpu,?": "number",      // metaInput — scheduling only, NOT in the content-ID
+	"mem,?": "number"       // metaInput (GiB) — scheduling only, NOT in the content-ID
+})
+
+self.defineOutputs("stats")
+
+self.body(func(inputs) {
+	cpu := is_undefined(inputs.cpu) ? 1 : inputs.cpu
+	memGiB := is_undefined(inputs.mem) ? 4 : inputs.mem
+
+	// Build the full-source TSV: entity-key axis + one column per source column,
+	// each under the header the caller assigned (the keys of `cols`). Map order is
+	// irrelevant — the header names the column, and each scope's sourceColumns
+	// reference those same headers. The caller already deduped columns by spec (a
+	// column shared by Fv and a standalone chain appears once, under one header that
+	// both scopes' sourceColumns point at), so the builder never sees a duplicate
+	// internalId here.
+	seqTb := pframes.tsvFileBuilder()
+	seqTb.setAxisHeader(inputs.keyAxisSpec, inputs.keyCol)
+	for header, col in inputs.cols {
+		seqTb.add(col, { header: header })
+	}
+	seqTb.mem(string(memGiB) + "GiB")
+	seqTb.cpu(cpu)
+	sourceTsv := seqTb.build()
+
+	// All-scope plan; sourceColumns already reference the seqN headers above.
+	planScopes := []
+	for sc in inputs.scopes {
+		planScopes = append(planScopes, {
+			name: sc.name,
+			feature: sc.feature,
+			chain: sc.chain,
+			label: sc.label,
+			model: inputs.modelTag,
+			sourceColumns: sc.sourceColumns
+		})
+	}
+	// Canonical encoding keeps the plan bytes deterministic.
+	planJson := string(canonical.encode({ device: inputs.device, scopes: planScopes }))
+
+	// --max-length omitted: main.py defaults it to the ESM-2 limit (the enforcer
+	// owns the constant) and writes it into stats for the UI truncation note.
+	run := exec.builder().
+		software(soft).
+		cpu(cpu).
+		mem(string(memGiB) + "GiB").
+		addFile("source.tsv", sourceTsv).
+		writeFile("plan.json", planJson).
+		arg("--stats-only").
+		arg("--input").arg("source.tsv").
+		arg("--plan").arg("plan.json").
+		arg("--key-col").arg(inputs.keyCol).
+		arg("--model-name").arg(inputs.modelTag).
+		arg("--stats").arg("stats.json").
+		saveFileContent("stats.json").
+		printErrStreamToStdout().
+		saveStdoutStream().
+		run()
+
+	return {
+		stats: run.getFileContent("stats.json")
+	}
+})

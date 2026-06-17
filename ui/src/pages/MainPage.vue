@@ -2,7 +2,6 @@
 import type {
   AvailableScope,
   Fidelity,
-  WorkflowStats,
 } from "@platforma-open/milaboratories.sequence-embeddings.model";
 import type { PlRef } from "@platforma-sdk/model";
 import {
@@ -13,21 +12,28 @@ import {
   PlBtnGroup,
   PlDropdownMulti,
   PlDropdownRef,
-  PlLoaderCircular,
-  PlLogView,
   PlMaskIcon24,
   PlNumberField,
-  PlRow,
   PlSectionSeparator,
   PlSlideModal,
-  PlSpacer,
 } from "@platforma-sdk/ui-vue";
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import { useApp } from "../app";
+import ReportTable from "./ReportTable.vue";
 
 const app = useApp();
 
-const logOpen = ref(false);
+// Settings live in a slide-out panel (canonical layout); the page shows the run
+// report table. Open by default until an input is connected.
+const settingsOpen = ref(app.model.data.inputAnchor === undefined);
+
+// Close the settings panel when a run starts, so the report is visible.
+watch(
+  () => app.model.outputs.isRunning,
+  (isRunning) => {
+    if (isRunning) settingsOpen.value = false;
+  },
+);
 
 // Setter, not a watch on `inputAnchor`. A watcher would fire on server-patch
 // object replacements (other client edits, app reopen) and reset state the user
@@ -71,52 +77,29 @@ function onScopesChange(ids: string[]) {
 }
 
 const hasInput = computed(() => app.model.data.inputAnchor !== undefined);
-const hasScopes = computed(() => app.model.data.selectedScopes.length > 0);
-const isRunning = computed(() => app.model.outputs.isRunning === true);
-const stats = computed<WorkflowStats | undefined>(() => app.model.outputs.stats);
-const resultsStale = computed(() => app.model.outputs.resultsStale === true);
-
-// A run has produced (or is producing) outputs once the processing-log handle
-// exists — true throughout running, the finishing gap, and the results state, but
-// not before the first run. Gates the persistent status/results header.
-const hasRunOutputs = computed(() => app.model.outputs.processingLog !== undefined);
-
-// Report is shown once a run matching the current settings has completed.
-const showResults = computed(
-  () =>
-    hasInput.value && hasScopes.value && !isRunning.value && !!stats.value && !resultsStale.value,
-);
-
-// One line per computed scope: embedded count, plus dropped (+ reason) only when
-// some clonotypes lacked the sequence for that region.
-const reportRows = computed(() =>
-  (stats.value?.scopes ?? []).map((s) => {
-    let text = `${s.n_entities.toLocaleString()} sequences embedded`;
-    if (s.n_dropped_empty > 0) {
-      const reason = s.feature === "Fv" ? "incomplete pair" : "no sequence";
-      text += ` · ${s.n_dropped_empty.toLocaleString()} dropped (${reason})`;
-    }
-    return { key: s.name, region: s.label || s.name, text };
-  }),
-);
-
-// Truncation caps an over-long sequence; the row is still embedded — so it's a
-// quality caveat, not a drop. Surface only when it actually happened.
-const totalTruncated = computed(() =>
-  (stats.value?.scopes ?? []).reduce((acc, s) => acc + (s.n_truncated ?? 0), 0),
-);
-
-// The model's length cap in amino acids = its token limit (stats.max_length) minus
-// the 2 special tokens (<cls>/<eos>). Shown in the truncation warning.
-const maxResidues = computed(() => (stats.value?.max_length ?? 1024) - 2);
 </script>
 
 <template>
   <PlBlockPage>
     <template #title>Sequence Embeddings</template>
+    <template #append>
+      <PlBtnGhost @click.stop="() => (settingsOpen = true)">
+        Settings
+        <template #append>
+          <PlMaskIcon24 name="settings" />
+        </template>
+      </PlBtnGhost>
+    </template>
 
-    <!-- Settings live on the page: this block has no output table to occupy the
-         canvas, so a slide-out panel would just leave the page empty. -->
+    <!-- The run-report table renders every state itself (not-ready guidance,
+         loading animation, empty overlay, rows). Errors surface via the block
+         error panel. -->
+    <ReportTable />
+  </PlBlockPage>
+
+  <PlSlideModal v-model="settingsOpen" close-on-outside-click shadow>
+    <template #title>Settings</template>
+
     <PlDropdownRef
       :model-value="app.model.data.inputAnchor"
       :options="app.model.outputs.inputOptions"
@@ -171,7 +154,7 @@ const maxResidues = computed(() => (stats.value?.max_length ?? 1024) - 2);
         :step="1"
         :maxValue="1012"
       >
-        <template #tooltip> Host memory for the embedding step. Default: 32 GiB. </template>
+        <template #tooltip> Host memory for each embedding batch. Default: 32 GiB. </template>
       </PlNumberField>
       <PlNumberField
         v-model="app.model.data.cpu"
@@ -180,69 +163,8 @@ const maxResidues = computed(() => (stats.value?.max_length ?? 1024) - 2);
         :step="1"
         :maxValue="128"
       >
-        <template #tooltip> CPU cores for the embedding step. Default: 16. </template>
+        <template #tooltip> CPU cores for each embedding batch. Default: 16. </template>
       </PlNumberField>
     </PlAccordionSection>
-
-    <!-- Results are out of date: settings changed since the last completed run.
-         Suppressed while a run is in progress (the running indicator covers it). -->
-    <PlAlert v-if="resultsStale && !isRunning" type="info">
-      Settings changed — press <strong>Run</strong> to update the results.
-    </PlAlert>
-
-    <!-- Persistent status/results header. Stays mounted from run start through to
-         the report so the Logs button (and its row) never unmount. -->
-    <template v-if="hasRunOutputs">
-      <PlSectionSeparator compact />
-      <PlRow alignCenter>
-        <template v-if="isRunning">
-          <PlLoaderCircular size="16" />
-          <span>Computing embeddings…</span>
-        </template>
-        <h3 v-else-if="showResults" class="results-title">Results</h3>
-        <PlSpacer />
-        <PlBtnGhost @click.stop="() => (logOpen = true)">
-          Logs
-          <template #append>
-            <PlMaskIcon24 name="file-logs" />
-          </template>
-        </PlBtnGhost>
-      </PlRow>
-    </template>
-
-    <!-- Run report. -->
-    <template v-if="showResults">
-      <!-- Per-scope lines kept as one tight block: the SDK's 24px vertical gap
-           would space these out too much. -->
-      <div class="results">
-        <template v-if="reportRows.length > 0">
-          <div v-for="row in reportRows" :key="row.key">
-            <strong>{{ row.region }}</strong> — {{ row.text }}
-          </div>
-        </template>
-        <div v-else>No sequences were embedded — check the processing log.</div>
-      </div>
-
-      <PlAlert v-if="totalTruncated > 0" type="warn">
-        {{ totalTruncated.toLocaleString() }} sequence(s) exceeded the model's
-        {{ maxResidues.toLocaleString() }}-amino-acid limit and were truncated before embedding.
-      </PlAlert>
-    </template>
-  </PlBlockPage>
-
-  <PlSlideModal v-model="logOpen" width="80%">
-    <template #title>Processing Log</template>
-    <PlLogView :log-handle="app.model.outputs.processingLog" />
   </PlSlideModal>
 </template>
-
-<style scoped>
-.results {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.results-title {
-  margin: 0;
-}
-</style>

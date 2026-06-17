@@ -1,78 +1,82 @@
-// Compute-embeddings subtemplate — runs the Python ESM-2 embedding exec and
-// exposes its per-scope Parquet outputs + stats + processing log.
+// compute-embeddings — per-batch body for `pframes.processColumn` batch mode.
 //
-// The caller (main.tpl.tengo) imports the Parquet outputs and assembles the pframe.
+// Rendered once per batch by the orchestrator. Receives one batch's sequence
+// TSV as `__value__` (a Blob, passContent=false): columns are the entity-key
+// axis (named `keyCol`) plus the scope's per-column sequence headers (seqN). The
+// scope's plan, model tag, key-column name and device tier ride as `extra`
+// inputs; cpu/mem ride as `metaExtra` (scheduling only, not in the content ID).
+//
+// One scope per run (full per-scope) — the plan carries a single scope. Runs the
+// ESM-2 Python step over the batch and returns:
+//   - "embedding"  : long-format Parquet (<keyCol>, embedding_dim, value),
+//                    Xsv-imported and merged across batches by the orchestrator.
+// (The per-clonotype truncation flag is added with the report step.)
+//
+// Asset usage: model weights live in `support/assets-protein-embeddings/`
+// (esm2-650M, esm2-150M).
 
 self := import("@platforma-sdk/workflow-tengo:tpl")
 exec := import("@platforma-sdk/workflow-tengo:exec")
 assets := import("@platforma-sdk/workflow-tengo:assets")
-
-json := import("json")
+pConstants := import("@platforma-sdk/workflow-tengo:pframes.constants")
 
 soft := assets.importSoftware("@platforma-open/milaboratories.sequence-embeddings.software:compute-embeddings")
 
-self.validateInputs({
-	"__options__,closed": "",
-	inputTsv: "any",            // sequences TSV (entity_key + per-scope seqN columns)
-	planJson: "any",            // canonical-encoded plan { device, scopes }
-	modelTag: "string",         // checkpoint to import/mount + --model-name identity
-	"cpu,?": "number",          // metaInput — scheduling only, NOT in the content-ID
-	"mem,?": "number"           // metaInput (GiB) — scheduling only, NOT in the content-ID
-})
-
-self.defineOutputs("embeddings", "stats", "processingLog")
+self.defineOutputs("embedding")
 
 self.body(func(inputs) {
-	plan := json.decode(inputs.planJson)
+	batchFile := inputs[pConstants.VALUE_FIELD_NAME]
+	planJson := inputs.planJson       // canonical-encoded { device, scopes: [scope] }
+	scopeName := inputs.scopeName      // single scope's filename-safe name
+	modelTag := inputs.modelTag        // checkpoint id + --model-name identity
+	keyCol := inputs.keyCol            // entity-key column header in the batch TSV
+	device := inputs.device            // "cpu" | "gpu" (gates the GPU request)
 	cpu := is_undefined(inputs.cpu) ? 16 : inputs.cpu
 	memGiB := is_undefined(inputs.mem) ? 32 : inputs.mem
 
 	// Mount the checkpoint chosen by the caller.
 	modelAsset := undefined
-	if inputs.modelTag == "esm2-650M" {
+	if modelTag == "esm2-650M" {
 		modelAsset = assets.importAsset("@platforma-open/milaboratories.protein-embeddings-assets:esm2-650M")
 	} else {
 		modelAsset = assets.importAsset("@platforma-open/milaboratories.protein-embeddings-assets:esm2-150M")
 	}
 
-	pyBuilder := exec.builder().
+	embeddingFile := "embeddings/embeddings_" + scopeName + ".parquet"
+
+	builder := exec.builder().
 		software(soft).
 		mem(string(memGiB) + "GiB").
 		cpu(cpu).
 		addAsset(modelAsset, "model").
-		addFile("input.tsv", inputs.inputTsv).
-		writeFile("plan.json", inputs.planJson).
-		arg("--input").arg("input.tsv").
+		addFile("batch.tsv", batchFile).
+		writeFile("plan.json", planJson).
+		arg("--input").arg("batch.tsv").
 		arg("--plan").arg("plan.json").
+		arg("--key-col").arg(keyCol).
 		arg("--output-dir").arg("embeddings").
 		arg("--stats").arg("stats.json").
 		arg("--model-path").arg("model").
-		arg("--model-name").arg(inputs.modelTag).
+		arg("--model-name").arg(modelTag).
 		arg("--max-memory-gb").argExpr("{system.ram.gb}").
 		mkDir("embeddings")
 
-	// GPU vs CPU tier is decided by plan.device 
-	if plan.device == "gpu" {
-		pyBuilder.gpuMemory("16GiB")
+	// GPU vs CPU tier is decided by the plan's device.
+	if device == "gpu" {
+		builder.gpuMemory("16GiB")
 	} else {
-		pyBuilder.
+		builder.
 			arg("--workers").arg("0").
 			arg("--cpus").argExpr("{system.cpu}")
 	}
 
-	// All per-scope Parquets captured as ONE file set: defineOutputs is declared
-	// at load time, so we can't name one output per (dynamic) scope. The set map
-	// is keyed by the workdir-relative path (save.tpl.tengo); the caller pulls
-	// each scope's file out by "embeddings/embeddings_{scope.name}.parquet".
-	pyRun := pyBuilder.
-		saveFileSet("embeddings", "^embeddings/embeddings_.*\\.parquet$").
-		saveFileContent("stats.json").
+	run := builder.
+		saveFile(embeddingFile).
+		printErrStreamToStdout().
 		saveStdoutStream().
 		run()
 
 	return {
-		embeddings: pyRun.getFileSet("embeddings"),
-		stats: pyRun.getFileContent("stats.json"),
-		processingLog: pyRun.getStdoutStream()
+		embedding: run.getFile(embeddingFile)
 	}
 })

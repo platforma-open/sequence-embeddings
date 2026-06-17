@@ -42,6 +42,12 @@ catalogs:
     '@platforma-sdk/workflow-tengo':
       specifier: 6.6.0
       version: 6.6.0
+    ag-grid-enterprise:
+      specifier: ~34.1.2
+      version: 34.1.2
+    ag-grid-vue3:
+      specifier: ~34.1.2
+      version: 34.1.2
     shx:
       specifier: 0.4.0
       version: 0.4.0
@@ -156,6 +162,12 @@ importers:
       '@platforma-sdk/ui-vue':
         specifier: 'catalog:'
         version: 1.79.6(@bytecodealliance/preview2-shim@0.17.9)(@vue/compiler-dom@3.5.35)(@vue/server-renderer@3.5.35(vue@3.5.24(typescript@6.0.3)))(typescript@6.0.3)
+      ag-grid-enterprise:
+        specifier: 'catalog:'
+        version: 34.1.2
+      ag-grid-vue3:
+        specifier: 'catalog:'
+        version: 34.1.2(vue@3.5.24(typescript@6.0.3))
       typescript:
         specifier: '*'
         version: 6.0.3

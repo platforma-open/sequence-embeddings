@@ -452,20 +452,48 @@ class ParallelEmbedder:
 # --- per-scope orchestration ------------------------------------------------
 
 
-# Long-format output schema, shared by every per-scope ParquetWriter. The value
-# column is float32 — the model emits float32, and the imported PColumn's value
-# type is "Float" (columns.lib.tengo); storing float64 would only pad noise digits.
-# D is encoded in the embedding_dim VALUES (0..D-1), not the schema.
-LONG_SCHEMA = pa.schema([
-    ("entity_key", pa.large_string()),
-    ("embedding_dim", pa.int64()),
-    ("value", pa.float32()),
-])
+# Long-format output schema for every per-scope ParquetWriter. The key column is
+# named by `key_col` — in batch mode that is the batch-key axis name (e.g.
+# "pl7.app/vdj/clonotypeKey"), so the orchestrator's Xsv import keys on it; the
+# standalone default is "entity_key". The value column is float32 — the model
+# emits float32 and the imported PColumn's value type is "Float"
+# (columns.lib.tengo); float64 would only pad noise digits. D is encoded in the
+# embedding_dim VALUES (0..D-1), not the schema.
+def long_schema(key_col: str) -> pa.Schema:
+    return pa.schema([
+        (key_col, pa.large_string()),
+        ("embedding_dim", pa.int64()),
+        ("value", pa.float32()),
+    ])
 
 
 def col_present(col: str):
     """Polars predicate: this sequence column is present (non-null, non-empty)."""
     return pl.col(col).is_not_null() & (pl.col(col) != "")
+
+
+def compute_scope_counts(df: pl.DataFrame, source_columns: list[str], max_residues: int):
+    """Per-scope (n_entities, n_dropped_empty, n_truncated) over the FULL keyspace,
+    one vectorised pass — no embedding. Standalone twin of stream_embed's per-batch
+    scope_stats, used by the --stats-only report pass.
+
+    n_entities = rows with every source column present (non-empty); n_dropped_empty =
+    the rest; n_truncated = present rows whose sequence exceeds the token limit
+    (counted once per long chain, summed across columns for paired Fv)."""
+    if not all(c in df.columns for c in source_columns):
+        return 0, df.height, 0
+    pred = col_present(source_columns[0])
+    for c in source_columns[1:]:
+        pred = pred & col_present(c)
+    aggs = [pred.cast(pl.Int64).sum().alias("n_ent")]
+    for i, c in enumerate(source_columns):
+        aggs.append(
+            (pred & (pl.col(c).str.len_chars() > max_residues)).cast(pl.Int64).sum().alias(f"t{i}")
+        )
+    row = df.select(aggs).row(0)
+    n_ent = int(row[0] or 0)
+    n_trunc = sum(int(x or 0) for x in row[1:])
+    return n_ent, df.height - n_ent, n_trunc
 
 
 def embed_unique(seqs: list[str], embedder) -> np.ndarray:
@@ -480,18 +508,19 @@ def embed_unique(seqs: list[str], embedder) -> np.ndarray:
     return vecs[[pos[s] for s in seqs]]         # scatter back to input order
 
 
-def long_table(keys: list[str], matrix: np.ndarray) -> pa.Table:
-    """One chunk's long-format table: a row per (key, dim), matching LONG_SCHEMA.
-    `matrix` is (len(keys), outDim); for paired Fv outDim = 2D and dim runs 0..2D-1."""
+def long_table(keys: list[str], matrix: np.ndarray, key_col: str, schema: pa.Schema) -> pa.Table:
+    """One chunk's long-format table: a row per (key, dim), matching `schema`.
+    `matrix` is (len(keys), outDim); for paired Fv outDim = 2D and dim runs 0..2D-1.
+    The key column is named `key_col` (the batch-key axis in batch mode)."""
     n, d = matrix.shape
     return pa.table(
         {
-            "entity_key": pa.array(np.repeat(np.asarray(keys, dtype=object), d),
-                                   type=pa.large_string()),
+            key_col: pa.array(np.repeat(np.asarray(keys, dtype=object), d),
+                              type=pa.large_string()),
             "embedding_dim": pa.array(np.tile(np.arange(d, dtype=np.int64), n), type=pa.int64()),
             "value": pa.array(matrix.reshape(-1).astype(np.float32), type=pa.float32()),
         },
-        schema=LONG_SCHEMA,
+        schema=schema,
     )
 
 
@@ -516,15 +545,19 @@ def resolve_chunk_size(args, dim: int, reserved_gb: float = 0.0) -> int:
 
 
 def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
-                 chunk_size: int, model_name: str) -> list[dict]:
+                 chunk_size: int, model_name: str, key_col: str) -> list[dict]:
     """Embed every selected scope in one pass over the keyspace, streaming each
     chunk's rows to a per-scope Parquet writer so peak RAM ~ chunk size (independent
     of N). Within a chunk each needed sequence column is embedded once and reused by
     every scope that consumes it: single-column scopes write that column directly;
     paired Fv joins its two columns on shared clonotypes (both chains live in the
-    same row, so the join is always within-chunk). Returns the per-scope stats list."""
+    same row, so the join is always within-chunk). Returns the per-scope stats list.
+
+    `key_col` names the entity-key column in both the input TSV and the output
+    files (the batch-key axis name in batch mode, "entity_key" standalone)."""
     available = set(df.columns)
     scopes = plan.scopes
+    schema = long_schema(key_col)
 
     def viable(sc: ScopePlan) -> bool:
         return all(c in available for c in sc.source_columns)
@@ -595,7 +628,7 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
         if len(sc.source_columns) == 1:
             keys, vecs, _ = col_data[sc.source_columns[0]]
             if keys:
-                writers[sc.name].write_table(long_table(keys, vecs))
+                writers[sc.name].write_table(long_table(keys, vecs, key_col, schema))
                 wrote.add(sc.name)
             return
         # Paired Fv: join the two chains on shared clonotypes (VH then VL); the
@@ -607,7 +640,7 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
         if common:
             mat = np.concatenate(
                 [vecsH[[posH[k] for k in common]], vecsL[[posL[k] for k in common]]], axis=1)
-            writers[sc.name].write_table(long_table(common, mat))
+            writers[sc.name].write_table(long_table(common, mat, key_col, schema))
             wrote.add(sc.name)
 
     try:
@@ -615,7 +648,7 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
         # mid-way, the finally below still closes the ones already opened.
         for sc in scopes:
             writers[sc.name] = pq.ParquetWriter(
-                str(output_dir / f"embeddings_{sc.name}.parquet"), LONG_SCHEMA)
+                str(output_dir / f"embeddings_{sc.name}.parquet"), schema)
         if col_pred:
             n_chunks = (df.height + chunk_size - 1) // chunk_size if df.height else 0
             for ci, cd in enumerate(df.iter_slices(n_rows=chunk_size)):
@@ -626,7 +659,7 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
                     col_data = {}
                     for col, pred in col_pred.items():
                         present = cd.filter(pred)
-                        keys = present["entity_key"].to_list()
+                        keys = present[key_col].to_list()
                         vecs = (embed_unique(present[col].to_list(), embedder) if keys
                                 else np.zeros((0, embedder.dim), dtype=np.float32))
                         col_data[col] = (keys, vecs, {k: i for i, k in enumerate(keys)})
@@ -644,7 +677,7 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
         # header-only table for any scope that produced no rows (empty / column absent).
         for name, w in writers.items():
             if name not in wrote:
-                w.write_table(LONG_SCHEMA.empty_table())
+                w.write_table(schema.empty_table())
     finally:
         for w in writers.values():
             try:
@@ -678,18 +711,63 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
     return entries
 
 
+# --- stats-only report pass -------------------------------------------------
+
+
+def run_stats_only(args, plan: Plan, df: pl.DataFrame, model_name: str) -> int:
+    """Compute the per-scope run-report counts over the full source and write
+    stats.json. No model load, no embedding — a cheap counting pass invoked by the
+    workflow alongside the batched embedding (which produces the actual vectors)."""
+    max_residues = args.max_length - 2
+    scopes = []
+    for sc in plan.scopes:
+        n_ent, n_drop, n_trunc = compute_scope_counts(df, sc.source_columns, max_residues)
+        scopes.append({
+            "name": sc.name,
+            "feature": sc.feature,
+            "chain": sc.chain,
+            "label": sc.label,
+            "model": model_name,
+            "n_entities": n_ent,
+            "n_dropped_empty": n_drop,
+            "n_truncated": n_trunc,
+        })
+        log_message(f"scope {sc.label or sc.name}: {n_ent} embedded"
+                    + (f", {n_drop} dropped (empty/partial)" if n_drop else "")
+                    + (f", {n_trunc} truncated >{max_residues} aa" if n_trunc else ""))
+    stats = {
+        "device_used": plan.device,
+        "model": model_name,
+        "max_length": args.max_length,
+        "scopes": scopes,
+    }
+    Path(args.stats).write_text(json.dumps(stats, indent=2))
+    log_message(f"Done (stats-only). Wrote report to {args.stats}", "STEP")
+    return 0
+
+
 # --- main -------------------------------------------------------------------
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Sequence Embeddings runner")
     parser.add_argument("--input", required=True, help="Input TSV path")
+    parser.add_argument("--key-col", default="entity_key",
+                        help="Entity-key column header in the input/output TSV. In batch mode this "
+                             "is the batch-key axis name (e.g. pl7.app/vdj/clonotypeKey); the output "
+                             "echoes it so the orchestrator's Xsv import can key on it.")
     parser.add_argument("--plan", required=True, help="Plan JSON path")
-    parser.add_argument("--output-dir", required=True,
-                        help="Directory for per-scope embeddings_{scope.name}.parquet files")
+    parser.add_argument("--stats-only", action="store_true",
+                        help="Report mode: compute per-scope counts over the full source and write "
+                             "--stats, then exit. No model load, no embedding (--model-path / "
+                             "--output-dir not needed). Used by the workflow's run-report step.")
+    parser.add_argument("--output-dir", default=None,
+                        help="Directory for per-scope embeddings_{scope.name}.parquet files "
+                             "(required unless --stats-only)")
     parser.add_argument("--stats", required=True, help="Stats JSON path")
-    parser.add_argument("--model-path", required=True,
-                        help="Mounted HF ESM-2 checkpoint directory — the exact model to use")
+    parser.add_argument("--model-path", default=None,
+                        help="Mounted HF ESM-2 checkpoint directory — the exact model to use "
+                             "(required unless --stats-only)")
     parser.add_argument("--model-name", default=None,
                         help="Model identity for stats/logs (default: --model-path directory name)")
     parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH,
@@ -718,10 +796,20 @@ def main() -> int:
     plan = parse_plan(Path(args.plan))
     df = read_input(Path(args.input))
     log_message(f"Loaded input {args.input}, shape={df.shape}")
+
+    model_name = args.model_name or (Path(args.model_path).name if args.model_path else "esm2")
+
+    # Report mode: count over the full source and exit (no model, no embedding).
+    if args.stats_only:
+        return run_stats_only(args, plan, df, model_name)
+
+    if not args.model_path:
+        raise SystemExit("--model-path is required for embedding (omit only with --stats-only)")
+    if not args.output_dir:
+        raise SystemExit("--output-dir is required for embedding (omit only with --stats-only)")
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    model_name = args.model_name or Path(args.model_path).name
     device = resolve_device(plan.device)
 
     # Decide CPU parallelism (workers × intra-op threads). Auto sizing and the
@@ -767,7 +855,8 @@ def main() -> int:
                 f"{chunk_size} (peak RAM bounded, independent of N)")
 
     try:
-        stats["scopes"] = stream_embed(plan, df, embedder, output_dir, chunk_size, model_name)
+        stats["scopes"] = stream_embed(plan, df, embedder, output_dir, chunk_size, model_name,
+                                       args.key_col)
     finally:
         embedder.close()
 

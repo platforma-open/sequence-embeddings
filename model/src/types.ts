@@ -65,23 +65,31 @@ export type WorkflowScopeStats = {
   /** Human-readable picker label (e.g. "Heavy CDR3 aa Primary") for the UI report. */
   label: string;
   model: ModelTag;
-  n_entities: number;
+  /**
+   * Per-scope counts. Optional: in batch mode they are aggregated post-run from the
+   * batched outputs (the report step). Absent until then; the UI degrades gracefully.
+   */
+  n_entities?: number;
   /** Clones dropped before inference (empty or partial sequence for this scope). */
-  n_dropped_empty: number;
+  n_dropped_empty?: number;
   /** Sequences truncated from the C-terminus for exceeding the token limit. */
-  n_truncated: number;
+  n_truncated?: number;
 };
 
 /**
- * Python step's `stats.json` shape. Consumed by the model layer to drive the
- * "what was computed" summary on the block UI and to surface device routing
- * decisions.
+ * Workflow run-summary shape. Consumed by the model layer to drive the "what was
+ * computed" summary on the block UI and to surface device routing decisions.
  */
 export type WorkflowStats = {
   device_used: "cpu" | "gpu";
   /** The single model loaded for the run (chosen by device tier). */
   model: ModelTag;
-  max_length: number;
+  /**
+   * Truncation limit in tokens (max residues = max_length − 2). Optional: added
+   * with the report step, sourced from the Python step that enforces it; the UI
+   * falls back to the ESM-2 default (1024) until then.
+   */
+  max_length?: number;
   scopes: WorkflowScopeStats[];
 };
 

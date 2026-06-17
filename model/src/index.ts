@@ -117,8 +117,9 @@ export const platforma = BlockModelV3.create(blockDataModel)
     },
     { retentive: true },
   )
-  // Python step's stats.json — surfaces device used, per-scope counts, errors.
-  // UI renders this as a "what was computed" summary panel.
+  // Workflow run summary — device, model, max_length and the per-scope list.
+  // Per-scope counts are added post-run (the report step). UI renders this as the
+  // "what was computed" panel.
   .output("stats", (ctx) => ctx.outputs?.resolve("stats")?.getDataAsJson<WorkflowStats>())
   // Quick gate for the UI's "running" indicator. Mirrors sequence-properties.
   .output("isRunning", (ctx) => ctx.outputs?.getIsReadyOrError() === false)
@@ -135,8 +136,10 @@ export const platforma = BlockModelV3.create(blockDataModel)
       ?.resolve({ field: "gpuAvailable", assertFieldType: "Input", allowPermanentAbsence: true })
       ?.getDataAsJson<boolean>(),
   )
-  // Workflow stderr — surfaced as a log viewer in the UI for diagnostics.
-  .output("processingLog", (ctx) => ctx.outputs?.resolve("processingLog")?.getLogHandle())
+  // No single processing log in batch mode: inference fans out across per-batch
+  // execs whose stdout the processColumn orchestrator does not surface as one
+  // stream. Diagnostics come from the run report; batch errors surface via the
+  // block's error panel.
   .title(() => "Sequence Embeddings")
   .subtitle((ctx) => ctx.data.defaultBlockLabel ?? "")
   .sections(() => [{ type: "link", href: "/", label: "Main" }])
