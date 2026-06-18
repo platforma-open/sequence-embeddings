@@ -1,0 +1,289 @@
+// Sequence Embeddings — workflow root (batch-processed).
+//
+// For each selected scope, runs the ESM-2 embedding step via
+// `pframes.processColumn` in BATCH mode: the orchestrator splits the scope's
+// keyspace into batches of `batch.size` (capped by `batch.maxBatches`), renders
+// the `compute-embeddings` body per batch, and merges each batch's long-format
+// output into one two-axis PColumn keyed (input axis × pl7.app/embeddingDim).
+// Full per-scope — one processColumn per selected scope (no grouping); the
+// additional embeddingDim axis is the additional-axes batch feature.
+//
+// Batch sizing is device-fixed: batch.size = MIN_BATCH[device] / columns-per-
+// clonotype (Fv embeds 2 sequences/clonotype, so its batch holds half as many
+// clonotypes). maxBatches soft-caps the count; the orchestrator inflates the
+// effective size at run time for large inputs.
+
+wf := import("@platforma-sdk/workflow-tengo:workflow")
+exec := import("@platforma-sdk/workflow-tengo:exec")
+assets := import("@platforma-sdk/workflow-tengo:assets")
+ll := import("@platforma-sdk/workflow-tengo:ll")
+pframes := import("@platforma-sdk/workflow-tengo:pframes")
+pSpec := import("@platforma-sdk/workflow-tengo:pframes.spec")
+canonical := import("@platforma-sdk/workflow-tengo:canonical")
+smart := import("@platforma-sdk/workflow-tengo:smart")
+render := import("@platforma-sdk/workflow-tengo:render")
+
+columnSpecs := import(":columns")
+
+// Per-batch embedding body (one scope, one batch).
+computeEmbeddingsTpl := assets.importTemplate(":compute-embeddings")
+
+// Run-report counting pass (--stats-only)
+computeStatsTpl := assets.importTemplate(":compute-stats")
+
+// Lightweight prerun: emits the backend's GPU-availability flag (exec.hasGpu) so
+// the UI can warn, before a run, when High fidelity is picked without a GPU.
+wf.setPreRun(assets.importTemplate(":prerun"))
+
+// Device-fixed minimum batch size (clonotypes per batch, single-column scope).
+// Fv (2 columns) is divided by its column count below. maxBatches caps the count.
+MIN_BATCH_GPU := 50000
+MIN_BATCH_CPU := 3000
+MAX_BATCHES := 50
+
+// ---------------------------------------------------------------------------
+// Entity-key axis recognition. The block embeds amino-acid sequences the same
+// way regardless of modality, so we only need to LOCATE the key axis.
+// ---------------------------------------------------------------------------
+
+isKeyAxis := func(axisSpec) {
+	return axisSpec.name == "pl7.app/variantKey" ||
+		axisSpec.name == "pl7.app/vdj/cloneId" ||
+		axisSpec.name == "pl7.app/vdj/clonotypeKey" ||
+		axisSpec.name == "pl7.app/vdj/scClonotypeKey"
+}
+
+// ---------------------------------------------------------------------------
+// wf.prepare — resolve the input column bundle for the body.
+// ---------------------------------------------------------------------------
+
+wf.prepare(func(args) {
+	bb := wf.createPBundleBuilder()
+	bb.ignoreMissingDomains()
+	bb.addAnchor("main", args.inputAnchor)
+
+	// Pull in each selected scope's sequence column(s) by their universal id.
+	// Fv carries two ids ([VH, VL]); single-chain scopes carry one.
+	for scope in args.selectedScopes {
+		for colId in scope.columns {
+			bb.addSingle(colId)
+		}
+	}
+
+	return { columns: bb.build() }
+})
+
+// ---------------------------------------------------------------------------
+// wf.body — per-scope batched processColumn; assemble the exported pframe.
+// ---------------------------------------------------------------------------
+
+wf.body(func(args) {
+	blockId := wf.blockId().getDataAsJson()
+	bundle := args.columns
+	datasetSpec := bundle.getSpec(args.inputAnchor)
+
+	axes := datasetSpec.axesSpec
+	if len(axes) == 0 {
+		ll.panic("input anchor has no axes")
+	}
+
+	// First axis matching a recognized entity-key name — the batch key.
+	keyAxisSpec := undefined
+	for _, axisSpec in axes {
+		if isKeyAxis(axisSpec) {
+			keyAxisSpec = axisSpec
+			break
+		}
+	}
+	if is_undefined(keyAxisSpec) {
+		ll.panic("no recognized sequence key axis found; connect a peptide extraction or MiXCR clonotyping dataset")
+	}
+	keyAxisName := keyAxisSpec.name
+
+	// Model + device tier, resolved at plan time.
+	modelTag := "esm2-150M"
+	if args.fidelity == "high" {
+		modelTag = "esm2-650M"
+	}
+	device := "cpu"
+	if exec.hasGpu {
+		device = "gpu"
+	}
+	minBatch := MIN_BATCH_CPU
+	if device == "gpu" {
+		minBatch = MIN_BATCH_GPU
+	}
+
+	// Advanced resource overrides for the embedding execs.
+	embedCpu := is_undefined(args.cpu) ? 16 : args.cpu
+	embedMemGiB := is_undefined(args.mem) ? 32 : args.mem
+
+	// Provenance trace seeded from the input dataset.
+	fidelityLabel := "Standard fidelity"
+	if modelTag == "esm2-650M" {
+		fidelityLabel = "High fidelity"
+	}
+	trace := pSpec.makeTrace(datasetSpec, {
+		type: "milaboratories.sequence-embeddings",
+		importance: 30,
+		label: "Sequence Embeddings (" + fidelityLabel + ")",
+		id: blockId
+	})
+	stamp := func(spec) {
+		return trace.inject(columnSpecs.cloneSpec(spec,
+			{ "pl7.app/blockId": blockId },
+			undefined))
+	}
+
+	pf := pframes.pFrameBuilder()
+	// Collected for the run-report counting pass (compute-stats). Columns ride in
+	// a MAP keyed by a global seqN header — render rejects arrays that contain
+	// references, so the column refs can't be nested in the per-scope array.
+	statsCols := {}      // seqN header -> source column {spec,data}
+	statsScopes := []    // [{ name, feature, chain, label, sourceColumns: [seqN] }] — ref-free
+	statsSeqIdx := 0
+	statsHeaderBySpec := {} // canonical(spec) -> seqN header — dedups columns shared across scopes
+
+	for scope in args.selectedScopes {
+		// Clean filename-safe scope name (feature[_chain]); also the column id.
+		scopeName := scope.feature
+		if scope.chain != "" {
+			scopeName = scope.feature + "_" + scope.chain
+		}
+
+		// Source columns → primary (first) + secondary (rest). Headers seqN match
+		// the plan's sourceColumns the Python step reads.
+		primaryCol := bundle.getColumn(scope.columns[0])
+		primaryEntry := { src: { spec: primaryCol.spec, data: primaryCol.data }, header: "seq0" }
+		srcHeaders := ["seq0"]
+		scopeCols := [primaryCol]
+		secondaryEntries := []
+		for i := 1; i < len(scope.columns); i++ {
+			h := "seq" + string(i)
+			c := bundle.getColumn(scope.columns[i])
+			secondaryEntries = append(secondaryEntries, { src: { spec: c.spec, data: c.data }, header: h })
+			srcHeaders = append(srcHeaders, h)
+			scopeCols = append(scopeCols, c)
+		}
+
+		// Augmented scope for the output column specs.
+		s := {
+			name: scopeName,
+			feature: scope.feature,
+			chain: scope.chain,
+			label: scope.label,
+			model: modelTag
+		}
+
+		// Single-scope plan for the Python step. Canonical encoding keeps the
+		// per-batch body content-ID deterministic (dedup).
+		scopePlan := {
+			device: device,
+			scopes: [{
+				name: scopeName,
+				feature: scope.feature,
+				chain: scope.chain,
+				label: scope.label,
+				model: modelTag,
+				sourceColumns: srcHeaders
+			}]
+		}
+		planJson := string(canonical.encode(scopePlan))
+
+		// Sequences-per-clonotype = column count (Fv = 2). Keep each batch's
+		// sequence volume ~constant by dividing the clonotype batch size.
+		batchSize := minBatch / len(scope.columns)
+
+		proc := pframes.processColumn(
+			{ primary: primaryEntry, columns: secondaryEntries, primaryJoin: "full" },
+			computeEmbeddingsTpl,
+			[{
+				type: "Xsv",
+				name: "embedding",
+				xsvType: "parquet",
+				settings: columnSpecs.buildEmbeddingOutputSettings(s, keyAxisName)
+			}],
+			{
+				batch: {
+					size: batchSize,
+					keyColumns: [keyAxisName],
+					format: "tsv",
+					passContent: false,
+					maxBatches: MAX_BATCHES
+				},
+				extra: {
+					planJson: smart.createJsonResource(planJson),
+					scopeName: smart.createJsonResource(scopeName),
+					modelTag: smart.createJsonResource(modelTag),
+					keyCol: smart.createJsonResource(keyAxisName),
+					device: smart.createJsonResource(device)
+				},
+				metaExtra: {
+					cpu: smart.createJsonResource(embedCpu),
+					mem: smart.createJsonResource(embedMemGiB)
+				}
+			}
+		)
+
+		// Merge the scope's embedding column into the export pframe, stamped with
+		// blockId + the provenance trace.
+		for colName in proc.listXsvColumns("embedding") {
+			o := proc.output("embedding", colName)
+			pf.add(scopeName, stamp(o.spec), o.data)
+		}
+
+		// Assign each of this scope's columns a global seqN header (refs ride in a
+		// map), deduplicating by column spec. A column can belong to more than one
+		// selected scope
+		statsHeaders := []
+		for col in scopeCols {
+			specKey := string(canonical.encode(col.spec))
+			h := statsHeaderBySpec[specKey]
+			if is_undefined(h) {
+				h = "seq" + string(statsSeqIdx)
+				statsCols[h] = col
+				statsHeaderBySpec[specKey] = h
+				statsSeqIdx = statsSeqIdx + 1
+			}
+			statsHeaders = append(statsHeaders, h)
+		}
+		statsScopes = append(statsScopes, {
+			name: scopeName,
+			feature: scope.feature,
+			chain: scope.chain,
+			label: scope.label,
+			sourceColumns: statsHeaders
+		})
+	}
+
+	finalPf := pf.build()
+
+	// -----------------------------------------------------------------------
+	// Run report — compute-stats builds the full-source TSV + all-scope plan from
+	// the scopes' columns collected above and runs `main.py --stats-only` (no
+	// model, no embedding) to count per-scope n_entities / n_dropped / n_truncated.
+	// -----------------------------------------------------------------------
+	statsRender := render.create(computeStatsTpl, {
+		cols: statsCols,
+		scopes: statsScopes,
+		keyAxisSpec: keyAxisSpec,
+		keyCol: keyAxisName,
+		device: device,
+		modelTag: modelTag
+	}, {
+		metaInputs: { cpu: 1, mem: 4 }
+	})
+
+	return {
+		outputs: {
+			stats: statsRender.output("stats"),
+			// embeddings rides outputs too so the model's isRunning
+			// (getIsReadyOrError) tracks the slow batched compute, not just the
+			// fast stats subtemplate.
+			embeddings: finalPf
+		},
+		exports: {
+			embeddings: finalPf
+		}
+	}
+})

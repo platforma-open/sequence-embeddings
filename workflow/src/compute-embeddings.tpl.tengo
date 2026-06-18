@@ -1,0 +1,83 @@
+// compute-embeddings — per-batch body for `pframes.processColumn` batch mode.
+//
+// Rendered once per batch by the orchestrator. Receives one batch's sequence
+// TSV as `__value__` (a Blob, passContent=false): columns are the entity-key
+// axis (named `keyCol`) plus the scope's per-column sequence headers (seqN). The
+// scope's plan, model tag, key-column name and device tier ride as `extra`
+// inputs; cpu/mem ride as `metaExtra` (scheduling only, not in the content ID).
+//
+// One scope per run (full per-scope) — the plan carries a single scope. Runs the
+// ESM-2 Python step over the batch and returns:
+//   - "embedding"  : long-format Parquet (<keyCol>, embedding_dim, value),
+//                    Xsv-imported and merged across batches by the orchestrator.
+// (The per-clonotype truncation flag is added with the report step.)
+//
+// Asset usage: model weights live in `support/assets-protein-embeddings/`
+// (esm2-650M, esm2-150M).
+
+self := import("@platforma-sdk/workflow-tengo:tpl")
+exec := import("@platforma-sdk/workflow-tengo:exec")
+assets := import("@platforma-sdk/workflow-tengo:assets")
+pConstants := import("@platforma-sdk/workflow-tengo:pframes.constants")
+
+soft := assets.importSoftware("@platforma-open/milaboratories.sequence-embeddings.software:compute-embeddings")
+
+self.defineOutputs("embedding")
+
+self.body(func(inputs) {
+	batchFile := inputs[pConstants.VALUE_FIELD_NAME]
+	planJson := inputs.planJson       // canonical-encoded { device, scopes: [scope] }
+	scopeName := inputs.scopeName      // single scope's filename-safe name
+	modelTag := inputs.modelTag        // checkpoint id + --model-name identity
+	keyCol := inputs.keyCol            // entity-key column header in the batch TSV
+	device := inputs.device            // "cpu" | "gpu" (gates the GPU request)
+	cpu := is_undefined(inputs.cpu) ? 16 : inputs.cpu
+	memGiB := is_undefined(inputs.mem) ? 32 : inputs.mem
+
+	// Mount the checkpoint chosen by the caller.
+	modelAsset := undefined
+	if modelTag == "esm2-650M" {
+		modelAsset = assets.importAsset("@platforma-open/milaboratories.protein-embeddings-assets:esm2-650M")
+	} else {
+		modelAsset = assets.importAsset("@platforma-open/milaboratories.protein-embeddings-assets:esm2-150M")
+	}
+
+	embeddingFile := "embeddings/embeddings_" + scopeName + ".parquet"
+
+	builder := exec.builder().
+		software(soft).
+		mem(string(memGiB) + "GiB").
+		cpu(cpu).
+		addAsset(modelAsset, "model").
+		addFile("batch.tsv", batchFile).
+		writeFile("plan.json", planJson).
+		arg("--input").arg("batch.tsv").
+		arg("--plan").arg("plan.json").
+		arg("--key-col").arg(keyCol).
+		arg("--output-dir").arg("embeddings").
+		arg("--stats").arg("stats.json").
+		arg("--model-path").arg("model").
+		arg("--model-name").arg(modelTag).
+		arg("--max-memory-gb").argExpr("{system.ram.gb}")
+		// @TODO: Update SDK and get mkDir("embeddings") once the fix that
+		// prevents it to create "[\"embeddings\"]" folder is released.
+
+	// GPU vs CPU tier is decided by the plan's device.
+	if device == "gpu" {
+		builder.gpuMemory("16GiB")
+	} else {
+		builder.
+			arg("--workers").arg("0").
+			arg("--cpus").argExpr("{system.cpu}")
+	}
+
+	run := builder.
+		saveFile(embeddingFile).
+		printErrStreamToStdout().
+		saveStdoutStream().
+		run()
+
+	return {
+		embedding: run.getFile(embeddingFile)
+	}
+})

@@ -1,0 +1,16 @@
+// Prerun: report the backend's GPU-availability flag so the UI can warn, before a
+// run, when High fidelity (ESM-2 650M) is selected on a GPU-less backend — where it
+// falls back to CPU and is very slow.
+
+wf := import("@platforma-sdk/workflow-tengo:workflow")
+exec := import("@platforma-sdk/workflow-tengo:exec")
+smart := import("@platforma-sdk/workflow-tengo:smart")
+
+wf.body(func(args) {
+	return {
+		outputs: {
+			gpuAvailable: smart.createJsonResource(exec.hasGpu)
+		},
+		exports: {}
+	}
+})

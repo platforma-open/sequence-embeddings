@@ -1,0 +1,134 @@
+// Output PColumn specs emitted by sequence-embeddings (batch mode).
+//
+// Public surface:
+//
+//   - `buildEmbeddingOutputSettings(scope, keyAxisName)`
+//                                       — Xsv output `settings` for a scope's
+//                                         `pframes.processColumn` batch run: the
+//                                         two-axis [keyAxis, embeddingDim]
+//                                         embedding column.
+//   - `cloneSpec(spec, dExtras, aExtras)` — spec-cloning helper used by main to
+//                                         layer blockId / trace onto an output spec.
+//
+// The input axis (clonotypeKey / variantKey / scClonotypeKey) is the batch key:
+// the batch orchestrator attaches its spec from `batch.keyColumns`, so the
+// settings reference it by NAME only. The embedding-dim axis is the additional
+// axis (`pl7.app/embeddingDim`, integer), enabled by the additional-axes batch
+// feature.
+//
+// Long-format body output (Parquet): the embedding file has columns
+// (<keyAxisName>, embedding_dim, value).
+
+ll := import("@platforma-sdk/workflow-tengo:ll")
+
+// Embedding-dim axis spec. Same shape for every emitted column — D is encoded
+// in the axis values (0..D-1), not the axis spec itself; downstream consumers
+// read D from the data shape and from pl7.app/embedding/model in the value
+// column's domain.
+EMBEDDING_DIM_AXIS := {
+	name: "pl7.app/embeddingDim",
+	type: "Int",
+	annotations: {
+		"pl7.app/label": "Embedding Dimension"
+	}
+}
+
+// Build the column label: the native picker label plus an "Embedding" suffix.
+buildLabel := func(scope) {
+	if scope.label == undefined || scope.label == "" {
+		return "Embedding"
+	}
+	return scope.label + " Embedding"
+}
+
+// Per-scope value-column domain. VDJ scopes carry their chain; peptide and Fv
+// (which spans both chains) do not.
+scopeDomain := func(scope) {
+	dom := {
+		"pl7.app/feature": scope.feature,
+		"pl7.app/embedding/model": scope.model
+	}
+	if scope.chain != "" {
+		dom["pl7.app/vdj/scClonotypeChain"] = scope.chain
+	}
+	return dom
+}
+
+// `scope` shape (one selected scope, full per-scope):
+//   {
+//     name:     string,   // file-safe scope name / column id, e.g. "peptide", "CDR3_A"
+//     feature:  string,   // "peptide" | "CDR3" | "VDJRegion" | "Fv" | "scFv"
+//     chain:    string,   // "A" | "B" | "" (peptide / Fv / scFv)
+//     label:    string,   // native picker label, e.g. "Heavy CDR3 aa Primary"
+//     model:    string    // "esm2-650M" | "esm2-150M"
+//   }
+
+// Xsv output `settings` for the scope's embedding column. `keyAxisName` is the
+// entity-key axis name (the batch key); the orchestrator supplies its spec.
+buildEmbeddingOutputSettings := func(scope, keyAxisName) {
+	return {
+		batchKeyColumns: [keyAxisName],
+		axes: [{ column: "embedding_dim", spec: EMBEDDING_DIM_AXIS }],
+		columns: [{
+			column: "value",
+			id: scope.name,
+			allowNA: false,
+			spec: {
+				name: "pl7.app/embedding",
+				valueType: "Float",
+				domain: scopeDomain(scope),
+				annotations: {
+					"pl7.app/label": buildLabel(scope),
+					"pl7.app/table/visibility": "hidden"
+				}
+			}
+		}],
+		storageFormat: "Parquet"
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Spec-cloning helper. Builds a fresh spec dict with optional domain and
+// annotation extras. Callers use this to layer per-consumer overrides (e.g.
+// `pl7.app/blockId` in domain, pSpec trace injection) without mutating the
+// input spec.
+// ---------------------------------------------------------------------------
+
+cloneSpec := func(spec, domainExtras, annotationExtras) {
+	// Shallow-copy every top-level key (kind, name, valueType, axesSpec, ...)
+	// so specs already filled in by the orchestrator keep their kind + axesSpec.
+	out := {}
+	for k, v in spec { out[k] = v }
+
+	// Overlay domain — always build a fresh dict so the result never aliases
+	// the caller's input domain.
+	newDomain := {}
+	if spec.domain {
+		for k, v in spec.domain { newDomain[k] = v }
+	}
+	if domainExtras {
+		for k, v in domainExtras { newDomain[k] = v }
+	}
+	out.domain = newDomain
+
+	// Overlay annotations — same fresh-dict rule.
+	newAnnotations := {}
+	if spec.annotations {
+		for k, v in spec.annotations { newAnnotations[k] = v }
+	}
+	if annotationExtras {
+		for k, v in annotationExtras { newAnnotations[k] = v }
+	}
+	out.annotations = newAnnotations
+
+	return out
+}
+
+// ---------------------------------------------------------------------------
+// Public exports.
+// ---------------------------------------------------------------------------
+
+export ll.toStrict({
+	buildEmbeddingOutputSettings: buildEmbeddingOutputSettings,
+	cloneSpec: cloneSpec
+})
