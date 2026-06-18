@@ -18,6 +18,7 @@ exec := import("@platforma-sdk/workflow-tengo:exec")
 assets := import("@platforma-sdk/workflow-tengo:assets")
 pframes := import("@platforma-sdk/workflow-tengo:pframes")
 canonical := import("@platforma-sdk/workflow-tengo:canonical")
+maps := import("@platforma-sdk/workflow-tengo:maps")
 
 soft := assets.importSoftware("@platforma-open/milaboratories.sequence-embeddings.software:compute-embeddings")
 
@@ -49,9 +50,10 @@ self.body(func(inputs) {
 	// internalId here.
 	seqTb := pframes.tsvFileBuilder()
 	seqTb.setAxisHeader(inputs.keyAxisSpec, inputs.keyCol)
-	for header, col in inputs.cols {
+	// Deterministic column order: maps.forEach iterates in key-sorted order.
+	maps.forEach(inputs.cols, func(header, col) {
 		seqTb.add(col, { header: header })
-	}
+	})
 	seqTb.mem(string(memGiB) + "GiB")
 	seqTb.cpu(cpu)
 	sourceTsv := seqTb.build()
