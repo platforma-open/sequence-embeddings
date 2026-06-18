@@ -88,7 +88,7 @@ const columnDefs = computed<ColDef<StatsRow>[]>(() => {
       valueFormatter: numFmt,
       headerComponentParams: {
         type: "Number",
-        info: "Input clonotypes or peptides for this region.",
+        tooltip: "Input clonotypes or peptides for this region.",
       } satisfies PlAgHeaderComponentParams,
       flex: 1,
       minWidth: 110,
@@ -101,7 +101,7 @@ const columnDefs = computed<ColDef<StatsRow>[]>(() => {
       valueFormatter: numFmt,
       headerComponentParams: {
         type: "Number",
-        info: "Successfully embedded clonotypes/peptides.",
+        tooltip: "Successfully embedded clonotypes/peptides.",
       } satisfies PlAgHeaderComponentParams,
       flex: 1,
       minWidth: 150,
@@ -114,7 +114,8 @@ const columnDefs = computed<ColDef<StatsRow>[]>(() => {
       valueFormatter: numFmt,
       headerComponentParams: {
         type: "Number",
-        info: "Clonotypes/peptides with no sequence for this region, removed before embedding. For Paired Fv, a clonotype missing either its VH or VL chain.",
+        tooltip:
+          "Clonotypes/peptides with no sequence for this region, removed before embedding. For Paired Fv, a clonotype missing either its VH or VL chain.",
       } satisfies PlAgHeaderComponentParams,
       flex: 1,
       minWidth: 110,
@@ -132,7 +133,7 @@ const columnDefs = computed<ColDef<StatsRow>[]>(() => {
       valueFormatter: numFmt,
       headerComponentParams: {
         type: "Number",
-        info: `Sequences longer than the model's ${maxResidues.value.toLocaleString()} amino-acid limit, truncated before embedding.`,
+        tooltip: `Sequences longer than the model's ${maxResidues.value.toLocaleString()} amino-acid limit, truncated before embedding.`,
       } satisfies PlAgHeaderComponentParams,
       flex: 1,
       minWidth: 160,

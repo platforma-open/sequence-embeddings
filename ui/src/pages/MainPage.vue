@@ -123,7 +123,8 @@ const hasInput = computed(() => app.model.data.inputAnchor !== undefined);
       @update:model-value="onScopesChange"
     >
       <template #tooltip>
-        Which sequence regions to embed. Paired Fv stands for embedding VH and VL chains together.
+        Which sequence region(s) to embed. Select one or more — each is embedded separately. Paired
+        Fv embeds the VH and VL chains together as one sequence.
       </template>
     </PlDropdownMulti>
 

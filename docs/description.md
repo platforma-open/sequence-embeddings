@@ -6,7 +6,7 @@ The block reads peptide datasets (from Peptide Profiling) or antibody/TCR clonot
 
 You choose the **model fidelity** — *Standard* (ESM-2 150M: faster, standard quality) or *High* (ESM-2 650M: high quality, slower). The block uses a GPU automatically when one is available; High fidelity is much faster on a GPU, so on a CPU-only machine with many sequences Standard fidelity is the best choice.
 
-The embeddings are available for **Sequence Clustering** and **Sequence Space** for similarity grouping and visualization.
+Embeddings are numeric vectors capturing each sequence's properties — used downstream for clustering and 2D sequence-space maps. In Platforma they feed directly into **Embedding Clustering** and **Sequence Space**, for similarity grouping and visualization.
 
 The block uses **ESM-2**, a protein language model developed by Meta AI Research and released under the MIT license. For more information, please see [https://github.com/facebookresearch/esm](https://github.com/facebookresearch/esm) and cite the following publication if used in your research:
 

@@ -58,8 +58,9 @@ self.body(func(inputs) {
 		arg("--stats").arg("stats.json").
 		arg("--model-path").arg("model").
 		arg("--model-name").arg(modelTag).
-		arg("--max-memory-gb").argExpr("{system.ram.gb}").
-		mkDir("embeddings")
+		arg("--max-memory-gb").argExpr("{system.ram.gb}")
+		// @TODO: Update SDK and get mkDir("embeddings") once the fix that
+		// prevents it to create "[\"embeddings\"]" folder is released.
 
 	// GPU vs CPU tier is decided by the plan's device.
 	if device == "gpu" {
