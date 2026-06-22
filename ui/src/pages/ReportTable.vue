@@ -23,7 +23,7 @@ const resultsStale = computed(() => app.model.outputs.resultsStale === true);
 // the 2 special tokens (<cls>/<eos>). Shown in the "Trimmed" column info tooltip.
 const maxResidues = computed(() => (stats.value?.max_length ?? 1024) - 2);
 
-// Columns are additive where it matters: Total = Successfully embedded + Dropped
+// Columns are additive where it matters: Total = Successfully embedded + Skipped (no sequence)
 // (every input entity ends up in one of those two). Trimmed is a SUBSET of
 // Successfully embedded (an over-long sequence is truncated but still embedded),
 // so it is NOT a third slice of Total — surfaced as a separate quality column
@@ -109,7 +109,7 @@ const columnDefs = computed<ColDef<StatsRow>[]>(() => {
     {
       colId: "dropped",
       field: "dropped",
-      headerName: "Dropped",
+      headerName: "Skipped (no sequence)",
       type: "numericColumn",
       valueFormatter: numFmt,
       headerComponentParams: {
