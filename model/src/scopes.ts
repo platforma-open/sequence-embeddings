@@ -16,6 +16,10 @@
  * (MiXCR assembled on VDJRegion). CDR3-assembled inputs expose CDR3 only — a
  * reconstructed full chain would be germline-dominated (TCR) or miss somatic
  * hypermutation (BCR), so it is deliberately not synthesized.
+ *
+ * Each scope carries `isHeavy` (IG heavy chain — single-cell chain A or bulk
+ * IGHeavy) so the heavy-only specialists (VHHBERT, H3BERTa) and the VHH-vs-mAb
+ * default can be resolved from the scope alone (see `compat.ts`).
  */
 import type {
   AnchoredPColumnSelector,
@@ -82,14 +86,32 @@ function isAssembling(spec: PColumnSpec): boolean {
 }
 
 /**
+ * Whether a VDJ scope is an IG heavy chain. Single-cell scopes carry the chain
+ * (`A` = heavy / `B` = light); bulk scopes carry `""` and put heavy/light on the
+ * input axis as `pl7.app/vdj/chain` (passed in as `bulkChain`).
+ */
+function deriveIsHeavy(
+  receptor: WorkflowReceptor,
+  chain: "A" | "B" | "",
+  bulkChain: string | undefined,
+): boolean {
+  if (receptor !== "IG") return false;
+  if (chain === "A") return true; // single-cell heavy
+  if (chain === "B") return false; // single-cell light
+  return bulkChain === "IGHeavy"; // bulk single-chain
+}
+
+/**
  * Build the scope picker config (options + first-connection defaults) from the
  * discovered sequence columns and the resolved receptor. Each entry carries its
  * own derived `label` (taken verbatim); the synthetic Paired Fv option uses this
- * block's own label.
+ * block's own label. `bulkChain` is the input-axis `pl7.app/vdj/chain` (bulk
+ * inputs only), used to resolve heavy/light when scopes carry no per-chain key.
  */
 export function buildScopeConfig(
   entries: SeqEntry[],
   receptor: WorkflowReceptor,
+  bulkChain?: string,
 ): Omit<ScopeConfig, "forAnchor"> {
   type Internal = AvailableScope & { assembling: boolean };
   const scopes: Internal[] = [];
@@ -108,6 +130,8 @@ export function buildScopeConfig(
         chain: "",
         columns: [e.id],
         label: e.label,
+        isHeavy: false,
+        receptor,
         assembling,
       });
       continue;
@@ -120,6 +144,8 @@ export function buildScopeConfig(
         chain: "",
         columns: [e.id],
         label: e.label,
+        isHeavy: false,
+        receptor,
         assembling,
       });
       continue;
@@ -132,6 +158,7 @@ export function buildScopeConfig(
       let feat = d["pl7.app/feature"] ?? d["pl7.app/vdj/feature"];
       if (feat === "VDJRegionInFrame") feat = "VDJRegion"; // amino-acid productive full chain
       const chain = (d["pl7.app/vdj/scClonotypeChain"] ?? "") as "A" | "B" | "";
+      const isHeavy = deriveIsHeavy(receptor, chain, bulkChain);
 
       if (feat === "CDR3") {
         scopes.push({
@@ -140,6 +167,8 @@ export function buildScopeConfig(
           chain,
           columns: [e.id],
           label: e.label,
+          isHeavy,
+          receptor,
           assembling,
         });
       } else if (feat === "VDJRegion") {
@@ -149,6 +178,8 @@ export function buildScopeConfig(
           chain,
           columns: [e.id],
           label: e.label,
+          isHeavy,
+          receptor,
           assembling,
         });
         if (chain === "A" || chain === "B") vdjByChain[chain] = e.id;
@@ -175,10 +206,16 @@ export function buildScopeConfig(
         chain: "",
         columns: [vdjByChain.A!, vdjByChain.B!], // [VH, VL] fixed order
         label: "Paired Fv",
+        isHeavy: false,
+        receptor,
         assembling: false,
       });
     }
   }
+
+  // Conventional paired antibody (light chain or Fv present) vs heavy-only
+  // (nanobody-like). Drives the VHHBERT-vs-CurrAb default in `recommendedModel`.
+  const paired = receptor === "IG" && (vdjByChain.B !== undefined || fvAvailable);
 
   // First-connection defaults.
   let defaultsInternal: Internal[];
@@ -203,6 +240,8 @@ export function buildScopeConfig(
     chain: s.chain,
     columns: s.columns,
     label: s.label,
+    isHeavy: s.isHeavy,
+    receptor: s.receptor,
   });
   const toSelected = (s: Internal): SelectedScope => ({
     id: s.id,
@@ -210,6 +249,13 @@ export function buildScopeConfig(
     chain: s.chain,
     columns: s.columns,
     label: s.label,
+    isHeavy: s.isHeavy,
+    receptor: s.receptor,
   });
-  return { options: scopes.map(toAvailable), defaults: defaultsInternal.map(toSelected) };
+  return {
+    options: scopes.map(toAvailable),
+    defaults: defaultsInternal.map(toSelected),
+    receptor,
+    paired,
+  };
 }

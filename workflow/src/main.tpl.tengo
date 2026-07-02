@@ -24,6 +24,7 @@ smart := import("@platforma-sdk/workflow-tengo:smart")
 render := import("@platforma-sdk/workflow-tengo:render")
 
 columnSpecs := import(":columns")
+models := import(":models")
 
 // Per-batch embedding body (one scope, one batch).
 computeEmbeddingsTpl := assets.importTemplate(":compute-embeddings")
@@ -62,10 +63,11 @@ wf.prepare(func(args) {
 	bb.ignoreMissingDomains()
 	bb.addAnchor("main", args.inputAnchor)
 
-	// Pull in each selected scope's sequence column(s) by their universal id.
-	// Fv carries two ids ([VH, VL]); single-chain scopes carry one.
-	for scope in args.selectedScopes {
-		for colId in scope.columns {
+	// Pull in each embedding task's sequence column(s) by their universal id.
+	// Fv carries two ids ([VH, VL]); single-chain scopes carry one. Tasks may
+	// share a scope (same sequence, different model) — addSingle dedups.
+	for task in args.embeddings {
+		for colId in task.scope.columns {
 			bb.addSingle(colId)
 		}
 	}
@@ -100,11 +102,7 @@ wf.body(func(args) {
 	}
 	keyAxisName := keyAxisSpec.name
 
-	// Model + device tier, resolved at plan time.
-	modelTag := "esm2-150M"
-	if args.fidelity == "high" {
-		modelTag = "esm2-650M"
-	}
+	// Device tier (shared by every task; the model choice is per-task).
 	device := "cpu"
 	if exec.hasGpu {
 		device = "gpu"
@@ -118,21 +116,23 @@ wf.body(func(args) {
 	embedCpu := is_undefined(args.cpu) ? 16 : args.cpu
 	embedMemGiB := is_undefined(args.mem) ? 32 : args.mem
 
-	// Provenance trace seeded from the input dataset.
-	fidelityLabel := "Standard fidelity"
-	if modelTag == "esm2-650M" {
-		fidelityLabel = "High fidelity"
-	}
-	trace := pSpec.makeTrace(datasetSpec, {
-		type: "milaboratories.sequence-embeddings",
-		importance: 30,
-		label: "Sequence Embeddings (" + fidelityLabel + ")",
-		id: blockId
-	})
-	stamp := func(spec) {
-		return trace.inject(columnSpecs.cloneSpec(spec,
-			{ "pl7.app/blockId": blockId },
-			undefined))
+	// Provenance trace seeded from the input dataset. The trace label and id carry
+	// the MODEL, so two columns embedding the same scope with different models get
+	// distinct provenance (hence distinct downstream labels), not merely a different
+	// pl7.app/embedding/model domain. Built per model (the per-column model also
+	// rides the value column's pl7.app/embedding/model domain).
+	makeStamp := func(modelTag) {
+		trace := pSpec.makeTrace(datasetSpec, {
+			type: "milaboratories.sequence-embeddings",
+			importance: 30,
+			label: "Sequence Embeddings (" + models.label(modelTag) + ")",
+			id: blockId + "/" + modelTag
+		})
+		return func(spec) {
+			return trace.inject(columnSpecs.cloneSpec(spec,
+				{ "pl7.app/blockId": blockId },
+				undefined))
+		}
 	}
 
 	pf := pframes.pFrameBuilder()
@@ -140,16 +140,22 @@ wf.body(func(args) {
 	// a MAP keyed by a global seqN header — render rejects arrays that contain
 	// references, so the column refs can't be nested in the per-scope array.
 	statsCols := {}      // seqN header -> source column {spec,data}
-	statsScopes := []    // [{ name, feature, chain, label, sourceColumns: [seqN] }] — ref-free
+	statsScopes := []    // [{ name, feature, chain, label, model, sourceColumns: [seqN] }] — ref-free
 	statsSeqIdx := 0
 	statsHeaderBySpec := {} // canonical(spec) -> seqN header — dedups columns shared across scopes
 
-	for scope in args.selectedScopes {
-		// Clean filename-safe scope name (feature[_chain]); also the column id.
+	for task in args.embeddings {
+		scope := task.scope
+		modelTag := models.resolveModelTag(task)
+
+		// Clean filename-safe scope name (feature[_chain]); the task name appends
+		// the model tag so the same scope embedded by two models/fidelities yields
+		// distinct columns. The model also rides the value column's domain.
 		scopeName := scope.feature
 		if scope.chain != "" {
 			scopeName = scope.feature + "_" + scope.chain
 		}
+		taskName := scopeName + "__" + modelTag
 
 		// Source columns → primary (first) + secondary (rest). Headers seqN match
 		// the plan's sourceColumns the Python step reads.
@@ -166,25 +172,31 @@ wf.body(func(args) {
 			scopeCols = append(scopeCols, c)
 		}
 
-		// Augmented scope for the output column specs.
+		// Augmented scope for the output column specs (unique id via taskName; the
+		// user-facing label stays the clean scope label).
 		s := {
-			name: scopeName,
+			name: taskName,
 			feature: scope.feature,
 			chain: scope.chain,
 			label: scope.label,
 			model: modelTag
 		}
 
-		// Single-scope plan for the Python step. Canonical encoding keeps the
+		// Single-task plan for the Python step. Canonical encoding keeps the
 		// per-batch body content-ID deterministic (dedup).
 		scopePlan := {
 			device: device,
 			scopes: [{
-				name: scopeName,
+				name: taskName,
 				feature: scope.feature,
 				chain: scope.chain,
 				label: scope.label,
 				model: modelTag,
+				// IG heavy-chain flag (single-cell chain A, or bulk IGHeavy). The
+				// Python step uses it to pick AbLang2's heavy/light slot for a
+				// single-chain scope (bulk light = chain "" + isHeavy false, so chain
+				// alone is insufficient).
+				isHeavy: scope.isHeavy,
 				sourceColumns: srcHeaders
 			}]
 		}
@@ -213,7 +225,7 @@ wf.body(func(args) {
 				},
 				extra: {
 					planJson: smart.createJsonResource(planJson),
-					scopeName: smart.createJsonResource(scopeName),
+					scopeName: smart.createJsonResource(taskName),
 					modelTag: smart.createJsonResource(modelTag),
 					keyCol: smart.createJsonResource(keyAxisName),
 					device: smart.createJsonResource(device)
@@ -225,16 +237,22 @@ wf.body(func(args) {
 			}
 		)
 
-		// Merge the scope's embedding column into the export pframe, stamped with
-		// blockId + the provenance trace.
+		// Merge this task's embedding column into the export pframe, stamped with
+		// blockId + the model-specific provenance trace.
+		stamp := makeStamp(modelTag)
 		for colName in proc.listXsvColumns("embedding") {
 			o := proc.output("embedding", colName)
-			pf.add(scopeName, stamp(o.spec), o.data)
+			pf.add(taskName, stamp(o.spec), o.data)
 		}
 
-		// Assign each of this scope's columns a global seqN header (refs ride in a
-		// map), deduplicating by column spec. A column can belong to more than one
-		// selected scope
+		// Run-report rows are per TASK (scope × model): the same scope embedded by
+		// two models yields two report rows, each carrying its own model so the UI
+		// can show one row per (sequence, model). Use taskName as the row identity.
+		// Sequence counts (n_entities/n_dropped) are model-independent; the same
+		// scope re-counted under another model is a cheap vectorised pass over the
+		// same columns. Assign each of the scope's columns a global seqN header
+		// (refs ride in a map), deduplicating by column spec across rows so a column
+		// shared by Fv and a standalone chain is materialised once.
 		statsHeaders := []
 		for col in scopeCols {
 			specKey := string(canonical.encode(col.spec))
@@ -248,10 +266,11 @@ wf.body(func(args) {
 			statsHeaders = append(statsHeaders, h)
 		}
 		statsScopes = append(statsScopes, {
-			name: scopeName,
+			name: taskName,
 			feature: scope.feature,
 			chain: scope.chain,
 			label: scope.label,
+			model: modelTag,
 			sourceColumns: statsHeaders
 		})
 	}
@@ -263,13 +282,16 @@ wf.body(func(args) {
 	// the scopes' columns collected above and runs `main.py --stats-only` (no
 	// model, no embedding) to count per-scope n_entities / n_dropped / n_truncated.
 	// -----------------------------------------------------------------------
+	// The counting pass is model-independent (it tallies sequences/truncation);
+	// pass a representative tag (the first task's) for max_length + the report.
+	reportModelTag := models.resolveModelTag(args.embeddings[0])
 	statsRender := render.create(computeStatsTpl, {
 		cols: statsCols,
 		scopes: statsScopes,
 		keyAxisSpec: keyAxisSpec,
 		keyCol: keyAxisName,
 		device: device,
-		modelTag: modelTag
+		modelTag: reportModelTag
 	}, {
 		metaInputs: { cpu: 1, mem: 4 }
 	})

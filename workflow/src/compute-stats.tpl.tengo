@@ -26,11 +26,12 @@ self.validateInputs({
 	"__options__,closed": "",
 	cols: "any",            // MAP: header -> source column {spec,data}. Columns ride in a
 	                        // map, not an array — render rejects arrays that contain references.
-	scopes: "any",          // [{ name, feature, chain, label, sourceColumns: [header] }] (ref-free)
+	scopes: "any",          // [{ name, feature, chain, label, model, sourceColumns: [header] }] (ref-free)
 	keyAxisSpec: "any",     // entity-key axis spec (for the TSV axis header)
 	keyCol: "string",       // entity-key column header (= batch-key axis name)
 	device: "string",       // "cpu" | "gpu" (recorded in the report)
-	modelTag: "string",     // model identity echoed into the report
+	modelTag: "string",     // representative model identity (top-level report field + --model-name);
+	                        // each scope carries its OWN model, which is what the per-row report uses
 	"cpu,?": "number",      // metaInput — scheduling only, NOT in the content-ID
 	"mem,?": "number"       // metaInput (GiB) — scheduling only, NOT in the content-ID
 })
@@ -66,7 +67,9 @@ self.body(func(inputs) {
 			feature: sc.feature,
 			chain: sc.chain,
 			label: sc.label,
-			model: inputs.modelTag,
+			// Each scope carries its own model so the report shows one row per
+			// (scope, model); fall back to the representative tag for safety.
+			model: is_undefined(sc.model) ? inputs.modelTag : sc.model,
 			sourceColumns: sc.sourceColumns
 		})
 	}

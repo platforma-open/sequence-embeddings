@@ -1,15 +1,22 @@
 import type { InferOutputsType } from "@platforma-sdk/model";
 import { BlockModelV3, PColumnCollection } from "@platforma-sdk/model";
+import { isCompatible } from "./compat";
 import { blockDataModel } from "./dataModel";
 import { buildScopeConfig, resolveReceptor, SEQUENCE_SELECTORS } from "./scopes";
-import type { BlockArgs, ScopeConfig, WorkflowStats } from "./types";
+import type { BlockArgs, EmbeddingTask, ScopeConfig, WorkflowStats } from "./types";
 
 export { blockDataModel } from "./dataModel";
+// Model catalog + scope↔model compatibility (used by the UI for the card dropdowns).
+export * from "./compat";
 export type {
   AvailableScope,
   BlockArgs,
   BlockData,
   BlockDataV1,
+  BlockDataV2,
+  EmbeddingCard,
+  EmbeddingModelId,
+  EmbeddingTask,
   Fidelity,
   ModelTag,
   ScopeConfig,
@@ -57,15 +64,44 @@ export const platforma = BlockModelV3.create(blockDataModel)
     if (data.inputAnchor === undefined) {
       throw new Error("Select an input dataset");
     }
-    if (data.selectedScopes.length === 0) {
-      throw new Error("Select at least one scope to embed");
+    if (data.embeddings.length === 0) {
+      throw new Error("Add at least one embedding");
     }
+    // Project each card to a (scope, model) task. Validate each card is complete
+    // and the pair is compatible — data-only (scope carries feature/isHeavy/
+    // receptor snapshots), so the lambda stays pure (the V3 idiom replacing
+    // V1's .argsValid()).
+    const tasks = data.embeddings.map((card): EmbeddingTask => {
+      if (card.scope === undefined) throw new Error("Each embedding needs a sequence selected");
+      if (card.model === undefined) throw new Error("Each embedding needs a model selected");
+      if (!isCompatible(card.scope.feature, card.scope.isHeavy, card.scope.receptor, card.model)) {
+        throw new Error(`${card.model} cannot embed "${card.scope.label}"`);
+      }
+      return {
+        scope: card.scope,
+        model: card.model,
+        // Fidelity applies only to ESM-2; drop it for other models so it doesn't
+        // perturb the args bytes.
+        fidelity: card.model === "esm2" ? (card.fidelity ?? "standard") : undefined,
+      };
+    });
+    // Reject exact-duplicate tasks (same scope + model + effective fidelity).
+    const seen = new Set<string>();
+    for (const t of tasks) {
+      const key = `${t.scope.id}|${t.model}|${t.fidelity ?? ""}`;
+      if (seen.has(key)) {
+        throw new Error(
+          `"${t.scope.label}" is already being embedded with this model — remove the duplicate embedding.`,
+        );
+      }
+      seen.add(key);
+    }
+    // Sort by (scope id, model) so a pure reorder of the card list doesn't change
+    // the args bytes and spuriously stale the block.
+    tasks.sort((a, b) => a.scope.id.localeCompare(b.scope.id) || a.model.localeCompare(b.model));
     return {
       inputAnchor: data.inputAnchor,
-      fidelity: data.fidelity,
-      // Sort by the stable picker id so a pure reorder of the multi-select
-      // doesn't change the args bytes and spuriously stale the block.
-      selectedScopes: [...data.selectedScopes].sort((a, b) => a.id.localeCompare(b.id)),
+      embeddings: tasks,
       mem: data.mem,
       cpu: data.cpu,
     };
@@ -82,10 +118,10 @@ export const platforma = BlockModelV3.create(blockDataModel)
     ctx.data.inputAnchor ? ctx.resultPool.getPColumnSpecByRef(ctx.data.inputAnchor) : undefined,
   )
   // Scope picker config — derived from the connected input's sequence columns.
-  // `options` feeds the multi-select; `defaults` is the first-connection
-  // selection. The UI snapshots a chosen scope's
-  // column id(s) into `data.selectedScopes` so the args lambda stays data-only.
-  // retentive: avoid the picker flickering empty while the pool re-resolves.
+  // `options` feeds each card's sequence dropdown; `defaults` (+ receptor/paired)
+  // seed the cards on first connection. The UI snapshots a chosen scope (column
+  // id(s), feature, isHeavy, receptor) into the card so the args lambda stays
+  // data-only. retentive: avoid the picker flickering empty while the pool re-resolves.
   .output(
     "availableScopes",
     (ctx): ScopeConfig | undefined => {
@@ -95,6 +131,9 @@ export const platforma = BlockModelV3.create(blockDataModel)
       const anchorCtx = ctx.resultPool.resolveAnchorCtx({ main: ref });
       if (spec === undefined || !anchorCtx) return undefined;
       const receptor = resolveReceptor(spec.axesSpec[1]?.domain);
+      // Bulk single-chain inputs carry heavy/light on the input axis (not on a
+      // per-chain key); pass it through so scopes get the right `isHeavy`.
+      const bulkChain = spec.axesSpec[1]?.domain?.["pl7.app/vdj/chain"];
       const entries = new PColumnCollection()
         .addColumnProvider(ctx.resultPool)
         .addAxisLabelProvider(ctx.resultPool)
@@ -109,6 +148,7 @@ export const platforma = BlockModelV3.create(blockDataModel)
         ...buildScopeConfig(
           entries.map((e) => ({ id: e.id, spec: e.spec, label: e.label })),
           receptor,
+          bulkChain,
         ),
         // Stamp the anchor this config belongs to, so the UI seed watcher can
         // reject a retained (stale) config from the previous input.

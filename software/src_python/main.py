@@ -97,6 +97,11 @@ class ScopePlan:
     chain: str                  # "A" | "B" | "" ("" for peptide / Fv / scFv)
     source_columns: list[str]   # 1 column → single embed; 2 → paired-Fv concat
     label: str = ""             # human-readable picker label, echoed into stats for the UI report
+    model: str = ""             # checkpoint tag for this scope; echoed per-row so the report
+                                # shows one row per (scope, model) (stats-only pass)
+    is_heavy: bool = True       # IG heavy chain? (single-cell chain A, or bulk IGHeavy).
+                                # Drives AbLang2's heavy/light slot for single-chain scopes;
+                                # default True so non-IG / unspecified scopes act as heavy.
 
 
 @dataclass(frozen=True)
@@ -114,6 +119,8 @@ def parse_plan(plan_path: Path) -> Plan:
             chain=s.get("chain", ""),
             source_columns=list(s["sourceColumns"]),
             label=s.get("label", ""),
+            model=s.get("model", ""),
+            is_heavy=bool(s.get("isHeavy", True)),
         )
         for s in raw["scopes"]
     ]
@@ -226,17 +233,76 @@ def resolve_parallelism(args, device, model_path: str) -> "tuple[int, int]":
     return workers, threads
 
 
+# --- input preparation ------------------------------------------------------
+
+
+def prepare_sequence(seq: str, input_kind: str) -> str:
+    """Model-specific transform applied to a raw AA sequence before tokenization.
+
+    Most models take the sequence as-is (`"aa"`). The exceptions:
+      - `"aa-cdr3-trimmed"` (H3BERTa): the model was trained on the bare CDR-H3
+        loop, but MiXCR's CDR3 includes the conserved anchors (`C…W`/`F`). Strip a
+        leading Cys and a trailing Trp/Phe — only when present, so a non-canonical
+        CDR3 keeps every residue rather than silently losing one.
+      - `"aa-spaced"` (TCR-BERT): its tokenizer expects residues space-separated
+        (`"C A S S ..."`) so the WordPiece splitter sees one token per residue.
+      - `"smiles"` (PeptideCLM-2): the model reads molecules, not residues, so the
+        peptide AA string is converted to a SMILES string via RDKit. A sequence
+        RDKit cannot parse (non-standard residues) yields "" → an ~zero embedding,
+        rather than failing the whole batch.
+    """
+    if input_kind == "aa-cdr3-trimmed":
+        if seq[:1] == "C":
+            seq = seq[1:]
+        if seq[-1:] in ("W", "F"):
+            seq = seq[:-1]
+        return seq
+    if input_kind == "aa-spaced":
+        return " ".join(seq)
+    if input_kind == "smiles":
+        from rdkit import Chem
+        mol = Chem.MolFromSequence(seq)
+        return Chem.MolToSmiles(mol) if mol is not None else ""
+    return seq
+
+
 # --- embedder ---------------------------------------------------------------
 
 
+# Config keys that hold the embedding width, in priority order. Standard HF encoders
+# use `hidden_size`; custom checkpoints name it differently (PeptideCLM-2: `embed_dim`).
+_HIDDEN_DIM_KEYS = ("hidden_size", "embed_dim", "d_model", "hidden_dim", "n_embd", "dim")
+
+
+def _hidden_dim_from_config(config) -> int:
+    """Embedding width from a HF config (a dict from config.json, or a loaded config
+    object), trying the known key names so custom checkpoints work too."""
+    get = config.get if isinstance(config, dict) else (lambda k: getattr(config, k, None))
+    for k in _HIDDEN_DIM_KEYS:
+        v = get(k)
+        if v:
+            return int(v)
+    raise SystemExit(f"could not determine embedding dim from config (tried {_HIDDEN_DIM_KEYS})")
+
+
 class Embedder:
-    """Loads one ESM-2-style checkpoint and embeds sequences via penultimate-layer
-    mean pooling. The model is loaded once and reused across all scopes."""
+    """Loads one HF encoder checkpoint and embeds sequences via penultimate-layer
+    mean pooling. The model is loaded once and reused across all scopes.
+
+    `AutoModel` selects the architecture from the checkpoint's config: ESM-2 and
+    CurrAb load as `EsmModel`, the antibody RoBERTa checkpoints (VHHBERT, H3BERTa)
+    as `RobertaModel`, TCR-BERT as `BertModel`. The pooling and special-token
+    handling below are architecture-generic, so one loader serves all of them.
+
+    `trust_remote_code=True` (PeptideCLM-2) loads the checkpoint's bundled custom
+    modeling code. Such custom models do not accept `add_pooling_layer`, so it is
+    only passed for the standard architectures."""
 
     def __init__(self, model_path: str, device, max_length: int, token_budget: int,
-                 threads: int = 0) -> None:
+                 threads: int = 0, input_kind: str = "aa", trust_remote_code: bool = False,
+                 emb_layer: int = -2, pool_special_tokens: bool = False) -> None:
         import torch
-        from transformers import AutoTokenizer, EsmModel
+        from transformers import AutoTokenizer, AutoModel
 
         # Cap intra-op threads when asked (0 = leave torch's default, which uses
         # all cores). Lets the single-process path run a controlled thread count
@@ -247,24 +313,49 @@ class Embedder:
         self.device = device
         self.max_length = max_length
         self.token_budget = token_budget
-        self.dtype = torch.float16 if device.type == "cuda" else torch.float32
-
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        # add_pooling_layer=False: we mean-pool ourselves; the pooler is
-        # unused classification scaffolding.
-        self.model = (
-            EsmModel.from_pretrained(model_path, add_pooling_layer=False, torch_dtype=self.dtype)
-            .to(device)
-            .eval()
+        self.input_kind = input_kind   # per-model sequence prep (see prepare_sequence)
+        # Which hidden layer to mean-pool. Indexes `output_hidden_states` (index 0 =
+        # embedding layer, 1..N = transformer blocks; -1 = last, -2 = penultimate).
+        # Per-model, following each model's OWN authoritative recipe: ESM-2 / CurrAb
+        # use penultimate (-2, our validated default); VHHBERT / H3BERTa use the last
+        # layer (-1, their papers/code); TCR-BERT uses its 8th transformer block (8,
+        # i.e. hidden_states[8] == -5), which its authors found optimal — neither last
+        # nor penultimate. PeptideCLM-2 (custom model) bypasses this via its mean_pool.
+        self.emb_layer = emb_layer
+        # Custom (trust_remote_code) models — PeptideCLM-2's ChemPepMTR — build their
+        # own attention mask/bias and crash under fp16 SDPA on CUDA ("invalid dtype
+        # for bias — should match query's dtype"). Keep them fp32 on every device;
+        # standard HF encoders still use fp16 on CUDA for speed/memory.
+        self.dtype = (
+            torch.float16 if (device.type == "cuda" and not trust_remote_code) else torch.float32
         )
-        self.dim = int(self.model.config.hidden_size)
 
-        # Exclude <cls>/<eos>/<pad> from the residue mean.
-        # <unk> is kept on purpose: a non-canonical residue tokenizes to <unk>
-        # and is still a residue position we want to pool over.
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code)
+        # add_pooling_layer=False: we mean-pool ourselves; the pooler is unused
+        # classification scaffolding. EsmModel/RobertaModel/BertModel all accept the
+        # kwarg, but a custom (trust_remote_code) model may not — so skip it there.
+        model_kwargs = {"torch_dtype": self.dtype}
+        if trust_remote_code:
+            model_kwargs["trust_remote_code"] = True
+        else:
+            model_kwargs["add_pooling_layer"] = False
+        self.model = AutoModel.from_pretrained(model_path, **model_kwargs).to(device).eval()
+        self.dim = _hidden_dim_from_config(self.model.config)
+
+        # Which token positions to drop from the residue mean. Padding is always
+        # excluded via the attention_mask (so it need not be listed here). The
+        # boundary specials (<cls>/<eos>, <sep> for BERT) are dropped UNLESS
+        # `pool_special_tokens` is set — a per-model choice matching each model's own
+        # recipe: ESM-2 / TCR-BERT exclude them (TCR-BERT's authors do so explicitly,
+        # ESM's example slices them off); VHHBERT / H3BERTa / PeptideCLM-2 INCLUDE
+        # them (their reference code means over all non-pad tokens). <unk> is always
+        # kept: a non-canonical residue tokenizes to <unk> but is still a residue
+        # position we want to pool over.
         tok = self.tokenizer
-        self.exclude_ids = {
-            i for i in (tok.cls_token_id, tok.eos_token_id, tok.pad_token_id) if i is not None
+        self.exclude_ids = set() if pool_special_tokens else {
+            i for i in (tok.cls_token_id, tok.eos_token_id, tok.sep_token_id, tok.pad_token_id)
+            if i is not None
         }
 
     def embed(self, sequences: list[str]) -> np.ndarray:
@@ -273,6 +364,10 @@ class Embedder:
         Sequences are length-sorted and packed into token-budget batches to
         minimise padding waste, then scattered back into input order.
         """
+        # Apply the model's input transform up front, so the length-sort, batching
+        # and truncation below all see the prepared (e.g. CDR3-trimmed) sequence.
+        if self.input_kind != "aa":
+            sequences = [prepare_sequence(s, self.input_kind) for s in sequences]
         out = np.empty((len(sequences), self.dim), dtype=np.float32)
         order = sorted(range(len(sequences)), key=lambda i: len(sequences[i]))
 
@@ -290,6 +385,15 @@ class Embedder:
         # write each result vector to its original index i (undoing the length-sort)
         self._run_batch(sequences, batch, out)
         return out
+
+    def embed_pairs(self, pairs: list[tuple[str, str]]) -> np.ndarray:
+        """Embed (heavy, light) chain pairs JOINTLY → an (N, dim) matrix. Each pair
+        is joined into one sequence with the tokenizer's cls token between the chains
+        — CurrAb's paired-input convention ("H<cls>L"). That separator is a
+        cls_token_id, already in exclude_ids, so it drops out of the residue mean:
+        the result is one D-vector per pair (a paired encoding, NOT a concat)."""
+        sep = self.tokenizer.cls_token
+        return self.embed([h + sep + l for h, l in pairs])
 
     def _run_batch(self, sequences: list[str], idxs: list[int], out: np.ndarray) -> None:
         """Embed one batch and write each vector back to its ORIGINAL row in `out`.
@@ -337,9 +441,24 @@ class Embedder:
         with torch.no_grad():
             out = self.model(**enc, output_hidden_states=True)
 
-        # 3. Take the penultimate layer, then mask down to RESIDUE positions only:
-        #    drop padding (attention_mask) and <cls>/<eos>/<pad> by id (<unk> kept).
-        hidden = out.hidden_states[-2]            # penultimate layer  [batch, L, D]
+        # 2b. Custom models (PeptideCLM-2) expose their OWN pooled embedding as a
+        #     `mean_pool` field (a pad-masked mean over the last layer, the recipe
+        #     its authors use downstream). Prefer it verbatim — it already pools, so
+        #     skip our layer-select + masking entirely.
+        mean_pool = getattr(out, "mean_pool", None)
+        if mean_pool is not None:
+            return mean_pool.float().cpu().numpy()
+
+        # 3. Pick the model's recommended hidden layer (self.emb_layer), then mask
+        #    down to the pooled positions: drop padding (attention_mask) and, unless
+        #    this model pools over specials, the boundary tokens by id (<unk> kept).
+        #    Custom models may not expose hidden_states, and a layer index out of
+        #    range falls back to the final layer's last_hidden_state.
+        hs = getattr(out, "hidden_states", None)
+        if hs is not None and -len(hs) <= self.emb_layer < len(hs):
+            hidden = hs[self.emb_layer]
+        else:
+            hidden = out.last_hidden_state
         ids = enc["input_ids"]
         mask = enc["attention_mask"].clone()
         for sid in self.exclude_ids:              # drop <cls>/<eos>/<pad> positions
@@ -367,7 +486,9 @@ class Embedder:
 _WORKER_EMBEDDER: "Embedder | None" = None
 
 
-def _init_worker(model_path: str, device_str: str, max_length: int, token_budget: int, threads: int) -> None:
+def _init_worker(model_path: str, device_str: str, max_length: int, token_budget: int,
+                 threads: int, input_kind: str = "aa", trust_remote_code: bool = False,
+                 emb_layer: int = -2, pool_special_tokens: bool = False) -> None:
     # Cap intra-op threads per worker so N workers don't oversubscribe the cores.
     # Set the env before torch is imported (it reads OMP/MKL at init), then pin
     # torch's own thread count (redundant but safe).
@@ -381,7 +502,9 @@ def _init_worker(model_path: str, device_str: str, max_length: int, token_budget
         except Exception:
             pass
     global _WORKER_EMBEDDER
-    _WORKER_EMBEDDER = Embedder(model_path, torch.device(device_str), max_length, token_budget)
+    _WORKER_EMBEDDER = Embedder(model_path, torch.device(device_str), max_length, token_budget,
+                                input_kind=input_kind, trust_remote_code=trust_remote_code,
+                                emb_layer=emb_layer, pool_special_tokens=pool_special_tokens)
 
 
 def _worker_embed(task: "tuple[int, list[str]]") -> "tuple[int, np.ndarray]":
@@ -411,15 +534,18 @@ class ParallelEmbedder:
     model."""
 
     def __init__(self, model_path: str, device, max_length: int, token_budget: int,
-                 workers: int, threads_per_worker: int) -> None:
+                 workers: int, threads_per_worker: int, input_kind: str = "aa",
+                 trust_remote_code: bool = False, emb_layer: int = -2,
+                 pool_special_tokens: bool = False) -> None:
         import torch
 
         self.max_length = max_length        # read by the orchestrator (truncation threshold)
         self.dtype = torch.float32          # CPU-only path; surfaced in stats
         self.workers = workers
+        self._model_path = str(model_path)  # for embed_pairs' lazy cls-token lookup
         # Read D from config.json so the PARENT never loads the model — only the
         # workers do. Avoids a redundant model copy in the orchestrator process.
-        self.dim = int(json.loads((Path(model_path) / "config.json").read_text())["hidden_size"])
+        self.dim = _hidden_dim_from_config(json.loads((Path(model_path) / "config.json").read_text()))
 
         # spawn (not fork): torch + fork is unsafe, and the parent has already
         # imported torch by now. spawn gives each worker a clean interpreter.
@@ -427,7 +553,8 @@ class ParallelEmbedder:
         self.pool = ctx.Pool(
             processes=workers,
             initializer=_init_worker,
-            initargs=(str(model_path), device.type, max_length, token_budget, threads_per_worker),
+            initargs=(str(model_path), device.type, max_length, token_budget, threads_per_worker,
+                      input_kind, trust_remote_code, emb_layer, pool_special_tokens),
         )
 
     def embed(self, sequences: list[str]) -> np.ndarray:
@@ -444,9 +571,107 @@ class ParallelEmbedder:
             out[start:start + mat.shape[0]] = mat
         return out
 
+    def embed_pairs(self, pairs: list[tuple[str, str]]) -> np.ndarray:
+        """Joint paired embedding (see Embedder.embed_pairs). Joins each pair with the
+        checkpoint's cls token, then fans the joined sequences out like any other
+        batch. The cls token is read once from the tokenizer (no model weights)."""
+        if not hasattr(self, "_cls_token"):
+            from transformers import AutoTokenizer
+            self._cls_token = AutoTokenizer.from_pretrained(self._model_path).cls_token
+        return self.embed([h + self._cls_token + l for h, l in pairs])
+
     def close(self) -> None:
         self.pool.close()
         self.pool.join()
+
+
+# --- ablang2 embedder (pip model, weights shipped as an asset) --------------
+
+
+class AbLang2Embedder:
+    """AbLang2 (antibody) embedder. Unlike the HF-checkpoint models, AbLang2 ships
+    its model CODE in the runenv (`ablang2` pip package) but fetches its WEIGHTS at
+    runtime from Zenodo. We ship those weights as an asset and, before loading,
+    place them into the package's `model-weights-ablang2-paired/` directory so
+    `pretrained()` finds them and loads OFFLINE (no network in the exec).
+
+    Same `embed`/`dim`/`dtype`/`max_length`/`close` interface as `Embedder`. Each
+    sequence is encoded UNPAIRED as `[seq, ""]` in `seqcoding` mode → a 480-d vector;
+    the orchestrator concatenates per-chain vectors for a paired Fv scope, exactly
+    as it does for every other model (the block's Fv handling is concat-of-chains,
+    so AbLang2 stays consistent rather than introducing joint-pair output here).
+
+    Runs single-process: the pip model is light, and this avoids spawning workers
+    that each re-provision weights and reload the package."""
+
+    DIM = 480
+
+    def __init__(self, model_path: str, device, max_length: int, token_budget: int,
+                 input_kind: str = "aa") -> None:
+        import shutil
+        import torch
+        import ablang2
+
+        # Provision the asset weights into the pip package so pretrained() is offline.
+        pkg_dir = Path(ablang2.__file__).parent
+        weights_dir = pkg_dir / "model-weights-ablang2-paired"
+        weights_dir.mkdir(parents=True, exist_ok=True)
+        src = Path(model_path)
+        for fn in ("model.pt", "hparams.json"):
+            dst = weights_dir / fn
+            if dst.exists():
+                continue
+            cand = src / fn
+            if not cand.exists():                      # asset may nest the files
+                found = list(src.rglob(fn))
+                cand = found[0] if found else None
+            if cand is None:
+                raise SystemExit(f"AbLang2 weight file {fn} not found under {model_path}")
+            shutil.copy(cand, dst)
+
+        self.device = device
+        self.max_length = max_length
+        self.dtype = torch.float32
+        self.dim = self.DIM
+        dev = "cuda" if device.type == "cuda" else "cpu"
+        self.model = ablang2.pretrained(
+            model_to_use="ablang2-paired", random_init=False, ncpu=1, device=dev)
+
+    def embed(self, sequences: list[str], is_light: bool = False) -> np.ndarray:
+        if not sequences:
+            return np.zeros((0, self.dim), dtype=np.float32)
+        # Batch so peak memory is bounded. AbLang2 takes a [heavy, light] record and
+        # tells the two chains apart by POSITION (heavy left of the internal `|`,
+        # light right) — NOT by content. So an unpaired chain must go in the correct
+        # slot: a heavy chain as [seq, ""], a light chain as ["", seq]. Putting a
+        # light chain in the heavy slot would encode it in heavy-chain context (a
+        # silently wrong vector). `is_light` is set per scope from the chain role.
+        def record(s: str) -> list[str]:
+            return ["", s] if is_light else [s, ""]
+        out = np.empty((len(sequences), self.dim), dtype=np.float32)
+        step = 256
+        for i in range(0, len(sequences), step):
+            chunk = sequences[i:i + step]
+            vecs = self.model([record(s) for s in chunk], mode="seqcoding")
+            out[i:i + len(chunk)] = np.asarray(vecs, dtype=np.float32)
+        return out
+
+    def embed_pairs(self, pairs: list[tuple[str, str]]) -> np.ndarray:
+        """Native PAIRED encoding: AbLang2 jointly encodes [heavy, light] → one 480-d
+        vector per pair (its intended use — the cross-chain signal a per-chain concat
+        would lose)."""
+        if not pairs:
+            return np.zeros((0, self.dim), dtype=np.float32)
+        out = np.empty((len(pairs), self.dim), dtype=np.float32)
+        step = 256
+        for i in range(0, len(pairs), step):
+            chunk = pairs[i:i + step]
+            vecs = self.model([[h, l] for h, l in chunk], mode="seqcoding")
+            out[i:i + len(chunk)] = np.asarray(vecs, dtype=np.float32)
+        return out
+
+    def close(self) -> None:
+        pass
 
 
 # --- per-scope orchestration ------------------------------------------------
@@ -496,16 +721,28 @@ def compute_scope_counts(df: pl.DataFrame, source_columns: list[str], max_residu
     return n_ent, df.height - n_ent, n_trunc
 
 
-def embed_unique(seqs: list[str], embedder) -> np.ndarray:
+def embed_unique(seqs: list[str], embedder, **embed_kwargs) -> np.ndarray:
     """Embed `seqs` (order preserved), embedding each DISTINCT string once → (N, D).
     Dedup is within this call — i.e. within a chunk — so convergent duplicates
-    (e.g. a shared CDR3) cost one forward pass, not one per occurrence."""
+    (e.g. a shared CDR3) cost one forward pass, not one per occurrence. Extra kwargs
+    (e.g. `is_light` for AbLang2) are forwarded to the embedder's `embed`."""
     if not seqs:
         return np.zeros((0, embedder.dim), dtype=np.float32)
     uniq = list(dict.fromkeys(seqs))            # distinct, first-appearance order
-    vecs = embedder.embed(uniq)                 # (U, D)
+    vecs = embedder.embed(uniq, **embed_kwargs)  # (U, D)
     pos = {s: i for i, s in enumerate(uniq)}
     return vecs[[pos[s] for s in seqs]]         # scatter back to input order
+
+
+def embed_pairs_unique(pairs: list[tuple[str, str]], embedder) -> np.ndarray:
+    """Like embed_unique, but for (heavy, light) pairs encoded JOINTLY: dedup
+    identical pairs within the chunk so a recurrent pair costs one encode → (N, D)."""
+    if not pairs:
+        return np.zeros((0, embedder.dim), dtype=np.float32)
+    uniq = list(dict.fromkeys(pairs))           # distinct pairs, first-appearance order
+    vecs = embedder.embed_pairs(uniq)           # (U, D)
+    pos = {p: i for i, p in enumerate(uniq)}
+    return vecs[[pos[p] for p in pairs]]        # scatter back to input order
 
 
 def long_table(keys: list[str], matrix: np.ndarray, key_col: str, schema: pa.Schema) -> pa.Table:
@@ -545,13 +782,20 @@ def resolve_chunk_size(args, dim: int, reserved_gb: float = 0.0) -> int:
 
 
 def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
-                 chunk_size: int, model_name: str, key_col: str) -> list[dict]:
+                 chunk_size: int, model_name: str, key_col: str,
+                 pair_mode: str = "concat") -> list[dict]:
     """Embed every selected scope in one pass over the keyspace, streaming each
     chunk's rows to a per-scope Parquet writer so peak RAM ~ chunk size (independent
     of N). Within a chunk each needed sequence column is embedded once and reused by
-    every scope that consumes it: single-column scopes write that column directly;
-    paired Fv joins its two columns on shared clonotypes (both chains live in the
-    same row, so the join is always within-chunk). Returns the per-scope stats list.
+    every scope that consumes it: single-column scopes write that column directly.
+
+    A paired Fv scope is handled per `pair_mode`:
+      - "concat" (default): embed each chain column separately and concatenate the
+        two per-chain vectors (VH⊕VL, 2D) — for models with no paired mode (ESM-2).
+      - "joint": encode (heavy, light) together → one D-vector, via the model's
+        paired path (CurrAb's H<cls>L join, AbLang2's native paired encoding).
+    Both chains live in the same row, so the pairing is always within-chunk.
+    Returns the per-scope stats list.
 
     `key_col` names the entity-key column in both the input TSV and the output
     files (the batch-key axis name in batch mode, "entity_key" standalone)."""
@@ -562,13 +806,20 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
     def viable(sc: ScopePlan) -> bool:
         return all(c in available for c in sc.source_columns)
 
+    def is_joint(sc: ScopePlan) -> bool:
+        # A 2-column (Fv) scope whose model encodes heavy+light together in one pass
+        # (CurrAb, AbLang2), as opposed to the default per-chain concat.
+        return pair_mode == "joint" and len(sc.source_columns) == 2
+
     # Per column, embed the rows that some selected scope needs: a single-column
     # scope needs every present row; a column used ONLY by Fv needs just the paired
     # intersection (so the Fv-only default embeds no unpaired singletons).
+    # Joint-Fv scopes embed their pair directly (see emit_joint) — they are excluded
+    # from the per-column embedding below so their chains aren't also encoded alone.
     single_cols: set[str] = set()
     fv_pairs: list[tuple[str, str]] = []
     for sc in scopes:
-        if not viable(sc):
+        if not viable(sc) or is_joint(sc):
             continue
         if len(sc.source_columns) == 1:
             single_cols.add(sc.source_columns[0])
@@ -577,7 +828,7 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
 
     col_pred: dict[str, pl.Expr] = {}
     for sc in scopes:
-        if not viable(sc):
+        if not viable(sc) or is_joint(sc):
             continue
         for c in sc.source_columns:
             if c in col_pred:
@@ -591,6 +842,17 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
                         pair = col_present(vh) & col_present(vl)
                         expr = pair if expr is None else (expr | pair)
                 col_pred[c] = expr if expr is not None else col_present(c)
+
+    # Single-chain columns belonging to a LIGHT chain (IG light: single-cell chain B
+    # or bulk IGLight → is_heavy False). Used only by AbLang2, whose seqcoding tells
+    # heavy from light by slot — a light chain must go in the light slot. Heavy and
+    # paired-Fv columns are unaffected (heavy slot / native pair handling).
+    light_cols = {
+        sc.source_columns[0]
+        for sc in scopes
+        if len(sc.source_columns) == 1 and not sc.is_heavy
+    }
+    ablang2 = isinstance(embedder, AbLang2Embedder)
 
     max_residues = embedder.max_length - 2
 
@@ -619,7 +881,10 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
         return n_ent, df.height - n_ent, n_trunc
 
     stat = {sc.name: scope_stats(sc) for sc in scopes}
-    out_dim = {sc.name: embedder.dim * len(sc.source_columns) for sc in scopes}
+    # Output width: a joint pair is one D-vector; otherwise D per source column
+    # (single = D, concat Fv = 2D).
+    out_dim = {sc.name: (embedder.dim if is_joint(sc) else embedder.dim * len(sc.source_columns))
+               for sc in scopes}
 
     writers: dict[str, pq.ParquetWriter] = {}
     wrote: set[str] = set()
@@ -643,13 +908,31 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
             writers[sc.name].write_table(long_table(common, mat, key_col, schema))
             wrote.add(sc.name)
 
+    def emit_joint(sc: ScopePlan, cd: pl.DataFrame) -> None:
+        # Joint paired Fv: gather (heavy, light) over clonotypes with BOTH chains in
+        # this chunk and encode each pair jointly → one D-vector (no concat). The
+        # pair columns are NOT in col_data — joint scopes are embedded only here.
+        cH, cL = sc.source_columns
+        present = cd.filter(col_present(cH) & col_present(cL))
+        keys = present[key_col].to_list()
+        if not keys:
+            return
+        pairs = list(zip(present[cH].to_list(), present[cL].to_list()))
+        writers[sc.name].write_table(
+            long_table(keys, embed_pairs_unique(pairs, embedder), key_col, schema))
+        wrote.add(sc.name)
+
+    # Joint-Fv scopes drive the chunk loop too, even when col_pred is empty (a run
+    # whose only scope is a joint pair embeds nothing per-column).
+    joint_scopes = [sc for sc in scopes if viable(sc) and is_joint(sc)]
+
     try:
         # Open per-scope writers inside the try so that if one constructor fails
         # mid-way, the finally below still closes the ones already opened.
         for sc in scopes:
             writers[sc.name] = pq.ParquetWriter(
                 str(output_dir / f"embeddings_{sc.name}.parquet"), schema)
-        if col_pred:
+        if col_pred or joint_scopes:
             n_chunks = (df.height + chunk_size - 1) // chunk_size if df.height else 0
             for ci, cd in enumerate(df.iter_slices(n_rows=chunk_size)):
                 # Real size of THIS slice (the last/only chunk is smaller than the
@@ -660,11 +943,18 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
                     for col, pred in col_pred.items():
                         present = cd.filter(pred)
                         keys = present[key_col].to_list()
-                        vecs = (embed_unique(present[col].to_list(), embedder) if keys
+                        # AbLang2 needs the chain's heavy/light slot; other embedders
+                        # ignore extra kwargs (none passed).
+                        kw = {"is_light": col in light_cols} if ablang2 else {}
+                        vecs = (embed_unique(present[col].to_list(), embedder, **kw) if keys
                                 else np.zeros((0, embedder.dim), dtype=np.float32))
                         col_data[col] = (keys, vecs, {k: i for i, k in enumerate(keys)})
                     for sc in scopes:
-                        if viable(sc):
+                        if not viable(sc):
+                            continue
+                        if is_joint(sc):
+                            emit_joint(sc, cd)
+                        else:
                             emit(sc, col_data)
                 except Exception as exc:  # noqa: BLE001 — log for the processing log, then re-raise
                     # A real embedding failure (model / CUDA / unrecoverable OOM /
@@ -727,7 +1017,10 @@ def run_stats_only(args, plan: Plan, df: pl.DataFrame, model_name: str) -> int:
             "feature": sc.feature,
             "chain": sc.chain,
             "label": sc.label,
-            "model": model_name,
+            # Per-row model: the scope's own checkpoint tag, so the same scope
+            # embedded by two models shows two report rows. Falls back to the
+            # run's representative --model-name if the plan omitted it.
+            "model": sc.model or model_name,
             "n_entities": n_ent,
             "n_dropped_empty": n_drop,
             "n_truncated": n_trunc,
@@ -770,6 +1063,30 @@ def main() -> int:
                              "(required unless --stats-only)")
     parser.add_argument("--model-name", default=None,
                         help="Model identity for stats/logs (default: --model-path directory name)")
+    parser.add_argument("--input-kind", default="aa",
+                        help="Per-model sequence transform before tokenization: 'aa' (as-is, "
+                             "default), 'aa-cdr3-trimmed' (strip CDR3's flanking C/W, H3BERTa), "
+                             "'aa-spaced' (space-separate residues, TCR-BERT), or 'smiles' "
+                             "(AA→SMILES, PeptideCLM-2). See prepare_sequence.")
+    parser.add_argument("--model-family", default="hf", choices=["hf", "hf-custom", "ablang2"],
+                        help="Loader family: 'hf' (standard AutoModel encoder, default), "
+                             "'hf-custom' (AutoModel with trust_remote_code, PeptideCLM-2), or "
+                             "'ablang2' (the ablang2 pip model with asset-shipped weights).")
+    parser.add_argument("--pair-mode", default="concat", choices=["concat", "joint"],
+                        help="How a paired Fv scope is embedded: 'concat' (default) embeds each "
+                             "chain separately and concatenates (VH⊕VL); 'joint' encodes heavy+light "
+                             "together → one vector, for models with a paired mode (CurrAb, AbLang2).")
+    parser.add_argument("--emb-layer", type=int, default=-2,
+                        help="Hidden layer to mean-pool, indexing output_hidden_states (0 = embedding "
+                             "layer, -1 = last, -2 = penultimate; positive = that transformer block). "
+                             "Per-model authoritative recipe: ESM-2/CurrAb -2, VHHBERT/H3BERTa -1, "
+                             "TCR-BERT 8. Ignored for models exposing their own pooled output "
+                             "(PeptideCLM-2) or non-HF pooling (AbLang2 seqcoding).")
+    parser.add_argument("--pool-special-tokens", action="store_true",
+                        help="Include the boundary special tokens (<cls>/<eos>/<sep>) in the residue "
+                             "mean (padding is always excluded). Off by default (ESM-2, TCR-BERT "
+                             "exclude them); set for VHHBERT/H3BERTa whose reference code means over "
+                             "all non-pad tokens.")
     parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH,
                         help="Max residue tokens incl. specials; longer sequences truncate from the C-terminus")
     parser.add_argument("--token-budget", type=int, default=DEFAULT_TOKEN_BUDGET,
@@ -816,13 +1133,33 @@ def main() -> int:
     # GPU/MPS single-process guard live in resolve_parallelism.
     workers, threads_per_worker = resolve_parallelism(args, device, args.model_path)
 
-    if workers > 1:
+    trust_remote_code = args.model_family == "hf-custom"
+    if args.model_family == "ablang2":
+        # The pip model runs single-process regardless of --workers (see class doc).
+        embedder = AbLang2Embedder(args.model_path, device, args.max_length, args.token_budget,
+                                   input_kind=args.input_kind)
+        workers, threads_per_worker = 1, 0
+        parallel_note = "ablang2 (single process)"
+    elif trust_remote_code:
+        # Custom trust_remote_code model (PeptideCLM-2): single process — spawn + the
+        # dynamic module import is fragile. Load once in-process; let torch use all cores.
+        embedder = Embedder(args.model_path, device, args.max_length, args.token_budget,
+                            threads=0, input_kind=args.input_kind, trust_remote_code=True,
+                            emb_layer=args.emb_layer, pool_special_tokens=args.pool_special_tokens)
+        workers, threads_per_worker = 1, 0
+        parallel_note = "hf-custom (single process)"
+    elif workers > 1:
         embedder = ParallelEmbedder(args.model_path, device, args.max_length, args.token_budget,
-                                    workers, threads_per_worker)
+                                    workers, threads_per_worker, input_kind=args.input_kind,
+                                    trust_remote_code=trust_remote_code,
+                                    emb_layer=args.emb_layer,
+                                    pool_special_tokens=args.pool_special_tokens)
         parallel_note = f"workers={workers}×{threads_per_worker} threads/worker"
     else:
         embedder = Embedder(args.model_path, device, args.max_length, args.token_budget,
-                            threads=threads_per_worker)
+                            threads=threads_per_worker, input_kind=args.input_kind,
+                            trust_remote_code=trust_remote_code,
+                            emb_layer=args.emb_layer, pool_special_tokens=args.pool_special_tokens)
         parallel_note = (f"workers=1 ({threads_per_worker} threads)"
                          if threads_per_worker > 0
                          else "workers=1 (single process, torch default threads)")
@@ -856,7 +1193,7 @@ def main() -> int:
 
     try:
         stats["scopes"] = stream_embed(plan, df, embedder, output_dir, chunk_size, model_name,
-                                       args.key_col)
+                                       args.key_col, pair_mode=args.pair_mode)
     finally:
         embedder.close()
 

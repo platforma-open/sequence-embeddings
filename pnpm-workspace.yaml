@@ -23,8 +23,8 @@ catalog:
   "ag-grid-enterprise": &ag-grid ~34.1.2
   "ag-grid-vue3": *ag-grid
 
-  "@platforma-open/milaboratories.runenv-python-3": 1.10.0
-  "@platforma-open/milaboratories.protein-embeddings-assets": 1.1.0
+  "@platforma-open/milaboratories.runenv-python-3": 1.10.7
+  "@platforma-open/milaboratories.protein-embeddings-assets": 1.2.0
 
   "turbo": 2.8.11
 

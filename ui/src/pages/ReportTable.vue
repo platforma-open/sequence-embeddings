@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { WorkflowStats } from "@platforma-open/milaboratories.sequence-embeddings.model";
+import { modelTagLabel } from "@platforma-open/milaboratories.sequence-embeddings.model";
 import type { PlAgHeaderComponentParams } from "@platforma-sdk/ui-vue";
 import { useAgGridOptions } from "@platforma-sdk/ui-vue";
 import type { ColDef, ValueFormatterParams } from "ag-grid-enterprise";
@@ -31,6 +32,7 @@ const maxResidues = computed(() => (stats.value?.max_length ?? 1024) - 2);
 type StatsRow = {
   key: string;
   region: string;
+  model: string;
   total: number | undefined;
   embedded: number | undefined;
   dropped: number | undefined;
@@ -49,6 +51,7 @@ const rowData = computed<StatsRow[]>(() =>
     return {
       key: s.name,
       region: s.label || s.name,
+      model: modelTagLabel(s.model),
       total,
       embedded,
       dropped,
@@ -79,6 +82,17 @@ const columnDefs = computed<ColDef<StatsRow>[]>(() => {
       headerComponentParams: { type: "Text" } satisfies PlAgHeaderComponentParams,
       flex: 2,
       minWidth: 220,
+    },
+    {
+      colId: "model",
+      field: "model",
+      headerName: "Model",
+      headerComponentParams: {
+        type: "Text",
+        tooltip: "Embedding model used to compute this row's results.",
+      } satisfies PlAgHeaderComponentParams,
+      flex: 1,
+      minWidth: 140,
     },
     {
       colId: "total",
@@ -149,7 +163,7 @@ const notReady = computed(
   () =>
     !isRunning.value &&
     (!hasInput.value ||
-      app.model.data.selectedScopes.length === 0 ||
+      app.model.data.embeddings.length === 0 ||
       !stats.value ||
       resultsStale.value),
 );
@@ -157,8 +171,8 @@ const notReady = computed(
 const notReadyText = computed(() => {
   if (!hasInput.value)
     return "Open Settings to select an input dataset and the sequences to embed.";
-  if (app.model.data.selectedScopes.length === 0)
-    return "Open Settings and choose which sequences to embed.";
+  if (app.model.data.embeddings.length === 0)
+    return "Open Settings and add at least one embedding.";
   if (resultsStale.value) return "Settings changed — press Run to update the results.";
   return "Press Run to compute embeddings.";
 });
