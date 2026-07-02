@@ -1,22 +1,34 @@
 """Sequence Embeddings — per-sequence embedding compute step.
 
-Loads ONE protein language model (the exact checkpoint the workflow chose for
-the runtime device tier and mounted via --model-path), embeds the sequences for
-each requested scope, mean-pools the penultimate-layer hidden states over
-residue positions, and writes a long-format Parquet per scope:
-``(entity_key, embedding_dim, value)``.
+Loads ONE protein language model (the exact checkpoint the workflow chose and
+mounted via --model-path), embeds the sequences for each requested scope, pools
+each into one fixed-length vector per sequence, and writes a long-format Parquet
+per scope: ``(entity_key, embedding_dim, value)``.
 
-The workflow picks the model (ESM-2 650M (fp16), ESM-2 150M (fp32)) and mounts
-exactly that checkpoint, so this script is model-agnostic: it loads whatever
-HuggingFace ESM-2-style checkpoint ``--model-path`` points at and reads the
-embedding dimension D from the model config. Weights load via 
-``from_pretrained(local_path)`` only.
+Supports several model families, selected by the workflow via --model-family:
+  - ``hf``        standard HuggingFace encoders (AutoModel): ESM-2 (universal),
+                  CurrAb, VHHBERT, H3BERTa, TCR-BERT.
+  - ``hf-custom`` HF models needing trust_remote_code (PeptideCLM-2), which expose
+                  their own pooled output.
+  - ``ablang2``   the ablang2 pip model (asset-shipped weights), pooled via its
+                  native seqcoding API.
+The embedding recipe is PER-MODEL and set by the workflow (single source of truth:
+``workflow/src/models.lib.tengo``): which hidden layer to mean-pool (--emb-layer),
+whether to keep boundary special tokens in the mean (--pool-special-tokens), the
+per-model input transform (--input-kind), and how a paired Fv is combined
+(--pair-mode). D is read from the model. Weights load offline via
+``from_pretrained(local_path)`` / the mounted asset only.
 
 I/O contract (with ``workflow/src/main.tpl.tengo``):
   --input      input.tsv   entity_key + one column per per-scope sequence
   --plan       plan.json   { device, scopes: [...] }
-  --model-path DIR         mounted HF checkpoint dir (the exact model to use)
+  --model-path DIR         mounted HF checkpoint dir / asset (the exact model to use)
   --model-name TAG         identity for stats/logs (default: directory name)
+  --model-family F         loader family: hf | hf-custom | ablang2
+  --input-kind K           per-model input prep: aa | aa-cdr3-trimmed | aa-spaced | smiles
+  --emb-layer N            hidden layer to mean-pool (-1 last, -2 penultimate, N block)
+  --pool-special-tokens    keep boundary specials (<cls>/<eos>/<sep>) in the mean (default: drop)
+  --pair-mode M            paired-Fv combination: concat (VH⊕VL) | joint (native paired)
   --output-dir DIR         writes embeddings_{scope.name}.parquet per scope
   --stats      stats.json  run metadata + per-scope counts
   --workers    N           CPU inference processes (1=single, default; 0=auto,
@@ -29,10 +41,11 @@ memory is bounded by the chunk size, not N. Within a chunk each needed sequence
 column is embedded once and reused across the scopes that consume it (single-column
 scopes write it directly; paired Fv joins its two chains on shared clonotypes).
 
-A scope is ``{ name, feature, chain, sourceColumns }``. A two-column scope is
-paired Fv: each chain is embedded independently and the two pooled vectors are
-concatenated (order as listed, VH then VL) → a 2D-dim vector. A
-single-column scope produces a D-dim vector.
+A scope is ``{ name, feature, chain, sourceColumns }``. A two-column scope is a
+paired Fv, combined per --pair-mode: ``concat`` embeds each chain independently
+and concatenates the two pooled vectors (order as listed, VH then VL) → 2D-dim;
+``joint`` encodes the pair natively (CurrAb, AbLang2) → D-dim. A single-column
+scope produces a D-dim vector.
 
 Long-format output → ``xsv.importFile`` builds the two-axis PColumn
 ``[inputAxis, pl7.app/embeddingDim]`` directly.
@@ -286,8 +299,9 @@ def _hidden_dim_from_config(config) -> int:
 
 
 class Embedder:
-    """Loads one HF encoder checkpoint and embeds sequences via penultimate-layer
-    mean pooling. The model is loaded once and reused across all scopes.
+    """Loads one HF encoder checkpoint and embeds sequences by mean-pooling a
+    per-model hidden layer (`emb_layer`, chosen by the workflow). The model is
+    loaded once and reused across all scopes.
 
     `AutoModel` selects the architecture from the checkpoint's config: ESM-2 and
     CurrAb load as `EsmModel`, the antibody RoBERTa checkpoints (VHHBERT, H3BERTa)
@@ -315,12 +329,12 @@ class Embedder:
         self.token_budget = token_budget
         self.input_kind = input_kind   # per-model sequence prep (see prepare_sequence)
         # Which hidden layer to mean-pool. Indexes `output_hidden_states` (index 0 =
-        # embedding layer, 1..N = transformer blocks; -1 = last, -2 = penultimate).
-        # Per-model, following each model's OWN authoritative recipe: ESM-2 / CurrAb
-        # use penultimate (-2, our validated default); VHHBERT / H3BERTa use the last
-        # layer (-1, their papers/code); TCR-BERT uses its 8th transformer block (8,
-        # i.e. hidden_states[8] == -5), which its authors found optimal — neither last
-        # nor penultimate. PeptideCLM-2 (custom model) bypasses this via its mean_pool.
+        # embedding layer, 1..N = transformer blocks; -1 = last, -2 = penultimate,
+        # a positive N = that block). The value is PER-MODEL and passed by the
+        # workflow via --emb-layer; the authoritative per-model choices (and their
+        # rationale) live in `workflow/src/models.lib.tengo`, the single source of
+        # truth — do not restate them here (they drift). PeptideCLM-2 (custom model)
+        # ignores this and pools via its own mean_pool output.
         self.emb_layer = emb_layer
         # Custom (trust_remote_code) models — PeptideCLM-2's ChemPepMTR — build their
         # own attention mask/bias and crash under fp16 SDPA on CUDA ("invalid dtype
@@ -1079,8 +1093,8 @@ def main() -> int:
     parser.add_argument("--emb-layer", type=int, default=-2,
                         help="Hidden layer to mean-pool, indexing output_hidden_states (0 = embedding "
                              "layer, -1 = last, -2 = penultimate; positive = that transformer block). "
-                             "Per-model authoritative recipe: ESM-2/CurrAb -2, VHHBERT/H3BERTa -1, "
-                             "TCR-BERT 8. Ignored for models exposing their own pooled output "
+                             "The per-model value is set by the workflow (source of truth: "
+                             "models.lib.tengo). Ignored for models exposing their own pooled output "
                              "(PeptideCLM-2) or non-HF pooling (AbLang2 seqcoding).")
     parser.add_argument("--pool-special-tokens", action="store_true",
                         help="Include the boundary special tokens (<cls>/<eos>/<sep>) in the residue "
