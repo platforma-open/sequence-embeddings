@@ -1,0 +1,112 @@
+// Central per-model registry for the sequence-embeddings workflow.
+//
+// Single source of truth for everything the workflow needs to know about a
+// checkpoint, keyed by its `ModelTag` (the pl7.app/embedding/model provenance
+// value). Consolidates knowledge that used to be scattered across templates:
+//   - resolveModelTag  : user-facing model id (+ ESM-2 fidelity) → ModelTag
+//   - MODELS           : per-tag scalars (dim, label, inputKind, family,
+//                        pairMode, embLayer, poolSpecials)
+//   - label / dim / outputVectorLength : derived lookups
+//
+// The one thing that CANNOT live here is the asset mount: `assets.importAsset`
+// requires a LITERAL reference, so compute-embeddings keeps an explicit per-tag
+// branch for that (asset selection only) — but pulls every other attribute from
+// this registry.
+//
+// Mirrors the TS model catalog in `model/src/compat.ts` (EMBEDDING_MODELS /
+// MODEL_TAG_LABELS). The two are independent runtimes (TS drives the UI, this
+// drives the workflow) so they can't share code — keep them in sync by hand.
+
+ll := import("@platforma-sdk/workflow-tengo:ll")
+
+// Per-tag attributes. Only WIRED checkpoints appear here; an unwired model id
+// (e.g. sceptr) never resolves to a tag (see resolveModelTag) and never reaches
+// this map. Fields:
+//   dim          : base embedding width D (single-chain / single-pass vector length)
+//   label        : human-readable name (column label + provenance trace)
+//   inputKind    : per-model sequence prep for main.py --input-kind
+//   family       : main.py --model-family loader (hf | hf-custom | ablang2)
+//   pairMode     : paired-Fv strategy — "joint" (native paired, one D-vector) or
+//                  "concat" (VH⊕VL per-chain concat → 2D). Drives --pair-mode AND
+//                  the Fv output-length doubling in outputVectorLength.
+//   embLayer     : hidden layer to mean-pool (main.py --emb-layer); -1 last,
+//                  -2 penultimate, 8 = TCR-BERT's 8th block. Moot for family
+//                  ablang2 (seqcoding) and hf-custom peptideclm2 (own mean_pool).
+//   poolSpecials : include boundary special tokens in the mean (main.py
+//                  --pool-special-tokens). See per-model-embedding-extraction.md.
+//   maxLength    : max tokens incl. specials (main.py --max-length; residue cap =
+//                  maxLength − 2). Fitted per checkpoint from its config
+MODELS := {
+	"esm2-650M": { dim: 1280, label: "ESM-2 (650M)", inputKind: "aa", family: "hf", pairMode: "concat", embLayer: -2, poolSpecials: false, maxLength: 1024 },
+	"esm2-150M": { dim: 640, label: "ESM-2 (150M)", inputKind: "aa", family: "hf", pairMode: "concat", embLayer: -2, poolSpecials: false, maxLength: 1024 },
+	"currab": { dim: 1280, label: "CurrAb", inputKind: "aa", family: "hf", pairMode: "joint", embLayer: -1, poolSpecials: false, maxLength: 322 },
+	"vhhbert": { dim: 768, label: "VHHBERT", inputKind: "aa-spaced", family: "hf", pairMode: "concat", embLayer: -1, poolSpecials: true, maxLength: 183 },
+	"h3berta": { dim: 768, label: "H3BERTa", inputKind: "aa-cdr3-trimmed", family: "hf", pairMode: "concat", embLayer: -1, poolSpecials: true, maxLength: 100 },
+	"tcr-bert": { dim: 768, label: "TCR-BERT", inputKind: "aa-spaced", family: "hf", pairMode: "concat", embLayer: 8, poolSpecials: false, maxLength: 64 },
+	"peptideclm2": { dim: 1024, label: "PeptideCLM-2", inputKind: "smiles", family: "hf-custom", pairMode: "concat", embLayer: -2, poolSpecials: false, maxLength: 2048 },
+	// AbLang2: rotary, NO hard cap; seqcoding ignores --max-length. Set far above any
+	// conceivable input (effectively unbounded) so AbLang2 (which never truncates) is
+	// never falsely counted as truncated.
+	"ablang2": { dim: 480, label: "AbLang2", inputKind: "aa", family: "ablang2", pairMode: "joint", embLayer: -2, poolSpecials: false, maxLength: 10000 }
+}
+
+// Map an embedding task (user-facing model id + optional ESM-2 fidelity) to its
+// checkpoint tag. ESM-2 splits by fidelity; every specialist is 1:1 (tag == id).
+// An unwired / unknown id hits the panic — a guard, since the UI gates selection
+// to the wired set (compat.ts ENABLED_MODELS).
+resolveModelTag := func(task) {
+	if task.model == "esm2" {
+		if task.fidelity == "high" {
+			return "esm2-650M"
+		}
+		return "esm2-150M"
+	}
+	// Specialists: the model id IS the tag (and a key in MODELS).
+	if !is_undefined(MODELS[task.model]) {
+		return task.model
+	}
+	ll.panic("embedding model %v is not yet wired in the workflow", task.model)
+	return ""
+}
+
+// Full attribute set for a tag; panics on an unknown tag (single source of truth).
+get := func(tag) {
+	m := MODELS[tag]
+	if is_undefined(m) {
+		ll.panic("unknown embedding model tag %v", tag)
+	}
+	return m
+}
+
+// Human-readable label for a tag; falls back to the raw tag for any unmapped tag
+// (used in labels/traces where a missing entry must not hard-fail).
+label := func(tag) {
+	m := MODELS[tag]
+	if is_undefined(m) {
+		return tag
+	}
+	return m.label
+}
+
+// Final output vector length for a (scope, model): the base width D, doubled for a
+// paired Fv scope embedded by a non-joint (concat) model — VH⊕VL → 2D. Single
+// chains, scFv, and joint-Fv (CurrAb/AbLang2) stay at D. undefined for an unmapped
+// model so callers can omit rather than guess.
+outputVectorLength := func(scope) {
+	m := MODELS[scope.model]
+	if is_undefined(m) {
+		return undefined
+	}
+	if scope.feature == "Fv" && m.pairMode != "joint" {
+		return m.dim * 2
+	}
+	return m.dim
+}
+
+export ll.toStrict({
+	MODELS: MODELS,
+	resolveModelTag: resolveModelTag,
+	get: get,
+	label: label,
+	outputVectorLength: outputVectorLength
+})

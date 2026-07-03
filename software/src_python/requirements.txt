@@ -3,3 +3,7 @@ transformers==4.53.2
 polars-lts-cpu==1.33.1
 numpy==2.2.6
 pyarrow==21.0.0
+# AbLang2 (antibody) — provides the model code + tokenizer; weights ship as an asset.
+ablang2==0.2.1
+# RDKit — PeptideCLM-2's AA→SMILES conversion (prepare_sequence "smiles").
+rdkit==2026.3.3

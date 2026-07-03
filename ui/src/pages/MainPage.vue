@@ -1,17 +1,18 @@
 <script setup lang="ts">
 import type {
-  AvailableScope,
-  Fidelity,
+  EmbeddingCard as EmbeddingCardData,
+  ScopeConfig,
 } from "@platforma-open/milaboratories.sequence-embeddings.model";
+import { EMBEDDING_MODELS } from "@platforma-open/milaboratories.sequence-embeddings.model";
 import type { PlRef } from "@platforma-sdk/model";
 import {
   PlAccordionSection,
   PlAlert,
   PlBlockPage,
   PlBtnGhost,
-  PlBtnGroup,
-  PlDropdownMulti,
+  PlBtnSecondary,
   PlDropdownRef,
+  PlElementList,
   PlMaskIcon24,
   PlNumberField,
   PlSectionSeparator,
@@ -19,6 +20,7 @@ import {
 } from "@platforma-sdk/ui-vue";
 import { computed, ref, watch } from "vue";
 import { useApp } from "../app";
+import EmbeddingCard from "./EmbeddingCard.vue";
 import ReportTable from "./ReportTable.vue";
 
 const app = useApp();
@@ -42,41 +44,76 @@ function setInput(ref?: PlRef) {
   app.model.data.inputAnchor = ref;
 }
 
-const fidelityOptions: { value: Fidelity; label: string }[] = [
-  { value: "standard", label: "Standard" },
-  { value: "high", label: "High" },
-];
+const hasInput = computed(() => app.model.data.inputAnchor !== undefined);
+const config = computed<ScopeConfig | undefined>(() => app.model.outputs.availableScopes);
 
-// Warn when High fidelity (ESM-2 650M) is picked on a backend without a GPU
-// `gpuAvailable` comes from the prerun (exec.hasGpu); undefined while it
-// resolves, so only warn on an explicit `false`.
-const highFidelityNoGpu = computed(
-  () => app.model.data.fidelity === "high" && app.model.outputs.gpuAvailable === false,
-);
+// Scopes are "ready" once the retentive `availableScopes` resolves AND matches the
+// CURRENT anchor (right after a dataset switch it can still hold the previous
+// input's config). Mirrors the seed gate in app.ts (`forAnchor === key`). The card
+// list and the (enabled) Add button depend on this; the section header and the
+// Add button itself are always rendered (Add stays disabled until ready), so the
+// Embeddings section is a permanent part of the panel — present before an input is
+// even chosen, not only after the input's defaults have been seeded.
+const scopesReady = computed(() => {
+  const anchor = app.model.data.inputAnchor;
+  if (anchor === undefined || config.value === undefined) return false;
+  return config.value.forAnchor === JSON.stringify(anchor);
+});
 
-// Scope multi-select. Options come from the model's input-shape detection
-// (availableScopes). The picker tracks scope ids; on change we snapshot the full
-// SelectedScope (incl. the column ids) into data so the args lambda stays data-only.
-const scopeOptions = computed(() =>
-  (app.model.outputs.availableScopes?.options ?? []).map((o) => ({ value: o.id, label: o.label })),
-);
-const selectedScopeIds = computed(() => app.model.data.selectedScopes.map((s) => s.id));
+// The embedding cards (scope × model tasks). Writable computed over the model
+// data — add/remove/reorder flow through the setter via PlElementList; per-card
+// edits write back through each card's v-model.
+const embeddings = computed<EmbeddingCardData[]>({
+  get: () => app.model.data.embeddings,
+  set: (v) => {
+    app.model.data.embeddings = v;
+  },
+});
 
-function onScopesChange(ids: string[]) {
-  const opts = app.model.outputs.availableScopes?.options ?? [];
-  app.model.data.selectedScopes = ids
-    .map((id) => opts.find((o) => o.id === id))
-    .filter((o): o is AvailableScope => o !== undefined)
-    .map((o) => ({
-      id: o.id,
-      feature: o.feature,
-      chain: o.chain,
-      columns: o.columns,
-      label: o.label,
-    }));
+// Cards are seeded per-anchor in app.ts (specialist-first defaults, guarded by
+// embeddingsInitializedForAnchor).
+
+// Duplicate detection: a fully-specified card (scope + model) whose (scope, model,
+// effective-fidelity) matches an EARLIER such card is a duplicate.
+const duplicateIds = computed<Set<string>>(() => {
+  const seen = new Set<string>();
+  const dups = new Set<string>();
+  for (const c of embeddings.value) {
+    if (c.scope === undefined || c.model === undefined) continue;
+    const fidelity = c.model === "esm2" ? (c.fidelity ?? "standard") : "";
+    const key = `${c.scope.id}|${c.model}|${fidelity}`;
+    if (seen.has(key)) dups.add(c.id);
+    else seen.add(key);
+  }
+  return dups;
+});
+
+function addEmbedding() {
+  embeddings.value = [
+    ...embeddings.value,
+    { id: crypto.randomUUID(), fidelity: "standard", isExpanded: true },
+  ];
 }
 
-const hasInput = computed(() => app.model.data.inputAnchor !== undefined);
+function cardTitle(card: EmbeddingCardData): string {
+  if (card.scope === undefined) return "New embedding";
+  const model = card.model === undefined ? "select a model" : EMBEDDING_MODELS[card.model].label;
+  const base = `${card.scope.label} — ${model}`;
+  // Mark duplicates in the title too, so they are identifiable while collapsed
+  // (the inline alert inside the card only shows when it is expanded).
+  return duplicateIds.value.has(card.id) ? `${base} (duplicate)` : base;
+}
+
+// GPU-heavy models (CurrAb, ESM-2 650M via High fidelity) run slowly on a CPU-only
+// backend. gpuAvailable comes from the prerun; undefined while it resolves, so
+// only warn on an explicit `false`.
+const slowOnCpu = computed(
+  () =>
+    app.model.outputs.gpuAvailable === false &&
+    embeddings.value.some(
+      (c) => c.model === "currab" || (c.model === "esm2" && (c.fidelity ?? "standard") === "high"),
+    ),
+);
 </script>
 
 <template>
@@ -114,35 +151,37 @@ const hasInput = computed(() => app.model.data.inputAnchor !== undefined);
       </template>
     </PlDropdownRef>
 
-    <PlDropdownMulti
-      :model-value="selectedScopeIds"
-      :options="scopeOptions"
-      label="Sequences to embed"
-      required
-      :disabled="!hasInput"
-      @update:model-value="onScopesChange"
+    <!-- Each card is one (sequence region, model) embedding. The sequence and
+         model dropdowns filter each other to compatible options; add a card to
+         embed another region, or the same region with a different model. -->
+    <PlSectionSeparator>Embeddings</PlSectionSeparator>
+    <PlElementList
+      v-if="scopesReady"
+      class="embeddings-list"
+      v-model:items="embeddings"
+      :get-item-key="(item) => item.id"
+      :is-expanded="(item) => item.isExpanded === true"
+      :on-expand="(item) => (item.isExpanded = !item.isExpanded)"
+      :disable-dragging="true"
     >
-      <template #tooltip>
-        Which sequence region(s) to embed. Select one or more — each is embedded separately. Paired
-        Fv embeds the VH and VL chains together as one sequence.
+      <template #item-title="{ item }">{{ cardTitle(item) }}</template>
+      <template #item-content="{ index }">
+        <!-- config is non-undefined here: the list only renders when scopesReady. -->
+        <EmbeddingCard
+          v-model="embeddings[index]"
+          :config="config!"
+          :duplicate="duplicateIds.has(embeddings[index].id)"
+        />
       </template>
-    </PlDropdownMulti>
+    </PlElementList>
 
-    <PlBtnGroup v-model="app.model.data.fidelity" :options="fidelityOptions" label="Model fidelity">
-      <template #tooltip>
-        Standard uses ESM-2 150M (faster, standard quality); High uses ESM-2 650M (high quality,
-        slower). As a rough guide for 10k sequences — Standard: ~40 s on GPU, ~15 min on CPU; High:
-        ~1.5 min on GPU, ~70 min on CPU.
-      </template>
-    </PlBtnGroup>
+    <PlBtnSecondary :disabled="!scopesReady" icon="add" @click="addEmbedding">
+      Add embedding
+    </PlBtnSecondary>
 
-    <!-- High fidelity needs a GPU to be fast; warn when none is available (CPU fallback is slow). -->
-    <PlAlert v-if="highFidelityNoGpu" type="warn">
-      <strong>High fidelity will be slow on this machine — it has no GPU.</strong>
-      It will run on the CPU instead, taking roughly
-      <strong>70 minutes per 10,000 sequences</strong> (Standard takes about 15 minutes). For faster
-      results, switch to <strong>Standard</strong>. Keep <strong>High</strong> only if you need the
-      best accuracy and can wait, or run the block on a machine that has a GPU.
+    <PlAlert v-if="slowOnCpu" type="warn">
+      <strong>Some selected models run best on a GPU — this machine has none.</strong>
+      They will run on the CPU and be substantially slower.
     </PlAlert>
 
     <PlAccordionSection label="Advanced Settings">
@@ -168,3 +207,10 @@ const hasInput = computed(() => app.model.data.inputAnchor !== undefined);
     </PlAccordionSection>
   </PlSlideModal>
 </template>
+
+<style scoped>
+/* Tighten the gap between the "Embeddings" separator and the first card. */
+.embeddings-list {
+  margin-top: -16px;
+}
+</style>

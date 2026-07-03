@@ -20,11 +20,12 @@
 // (<keyAxisName>, embedding_dim, value).
 
 ll := import("@platforma-sdk/workflow-tengo:ll")
+models := import(":models")
 
 // Embedding-dim axis spec. Same shape for every emitted column — D is encoded
-// in the axis values (0..D-1), not the axis spec itself; downstream consumers
-// read D from the data shape and from pl7.app/embedding/model in the value
-// column's domain.
+// in the axis values (0..D-1), not the axis spec itself; downstream consumers can
+// read D from the value column's `pl7.app/embedding/length` annotation (added in
+// buildEmbeddingOutputSettings) without loading the data, or from the data shape.
 EMBEDDING_DIM_AXIS := {
 	name: "pl7.app/embeddingDim",
 	type: "Int",
@@ -34,6 +35,8 @@ EMBEDDING_DIM_AXIS := {
 }
 
 // Build the column label: the native picker label plus an "Embedding" suffix.
+// (The model is NOT in the label — it rides the value column's
+// pl7.app/embedding/model domain and the per-model provenance trace.)
 buildLabel := func(scope) {
 	if scope.label == undefined || scope.label == "" {
 		return "Embedding"
@@ -66,6 +69,18 @@ scopeDomain := func(scope) {
 // Xsv output `settings` for the scope's embedding column. `keyAxisName` is the
 // entity-key axis name (the batch key); the orchestrator supplies its spec.
 buildEmbeddingOutputSettings := func(scope, keyAxisName) {
+	// Value-column annotations. The vector length D (the size of the embeddingDim
+	// axis) is added so downstream consumers can read it from the spec without
+	// loading the data (the axis values run 0..D-1 but the spec doesn't otherwise
+	// state D). Omitted for an unmapped model rather than guessed.
+	annotations := {
+		"pl7.app/label": buildLabel(scope),
+		"pl7.app/table/visibility": "hidden"
+	}
+	vlen := models.outputVectorLength(scope)
+	if !is_undefined(vlen) {
+		annotations["pl7.app/embedding/length"] = string(vlen)
+	}
 	return {
 		batchKeyColumns: [keyAxisName],
 		axes: [{ column: "embedding_dim", spec: EMBEDDING_DIM_AXIS }],
@@ -77,10 +92,7 @@ buildEmbeddingOutputSettings := func(scope, keyAxisName) {
 				name: "pl7.app/embedding",
 				valueType: "Float",
 				domain: scopeDomain(scope),
-				annotations: {
-					"pl7.app/label": buildLabel(scope),
-					"pl7.app/table/visibility": "hidden"
-				}
+				annotations: annotations
 			}
 		}],
 		storageFormat: "Parquet"

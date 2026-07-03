@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { WorkflowStats } from "@platforma-open/milaboratories.sequence-embeddings.model";
+import { modelTagLabel } from "@platforma-open/milaboratories.sequence-embeddings.model";
 import type { PlAgHeaderComponentParams } from "@platforma-sdk/ui-vue";
 import { useAgGridOptions } from "@platforma-sdk/ui-vue";
 import type { ColDef, ValueFormatterParams } from "ag-grid-enterprise";
@@ -19,10 +20,6 @@ const isRunning = computed(() => app.model.outputs.isRunning === true);
 const stats = computed<WorkflowStats | undefined>(() => app.model.outputs.stats);
 const resultsStale = computed(() => app.model.outputs.resultsStale === true);
 
-// The model's length cap in amino acids = its token limit (stats.max_length) minus
-// the 2 special tokens (<cls>/<eos>). Shown in the "Trimmed" column info tooltip.
-const maxResidues = computed(() => (stats.value?.max_length ?? 1024) - 2);
-
 // Columns are additive where it matters: Total = Successfully embedded + Skipped (no sequence)
 // (every input entity ends up in one of those two). Trimmed is a SUBSET of
 // Successfully embedded (an over-long sequence is truncated but still embedded),
@@ -31,10 +28,15 @@ const maxResidues = computed(() => (stats.value?.max_length ?? 1024) - 2);
 type StatsRow = {
   key: string;
   region: string;
+  model: string;
   total: number | undefined;
   embedded: number | undefined;
   dropped: number | undefined;
   trimmed: number | undefined;
+  // This row's model residue limit (its token cap minus the 2 specials). Per-model —
+  // the run can span models with different limits — so the threshold is per row, not
+  // a single column header. Undefined if the report didn't carry it.
+  maxResidues: number | undefined;
 };
 
 const rowData = computed<StatsRow[]>(() =>
@@ -49,10 +51,12 @@ const rowData = computed<StatsRow[]>(() =>
     return {
       key: s.name,
       region: s.label || s.name,
+      model: modelTagLabel(s.model),
       total,
       embedded,
       dropped,
       trimmed: s.n_truncated,
+      maxResidues: typeof s.max_length === "number" ? s.max_length - 2 : undefined,
     };
   }),
 );
@@ -79,6 +83,17 @@ const columnDefs = computed<ColDef<StatsRow>[]>(() => {
       headerComponentParams: { type: "Text" } satisfies PlAgHeaderComponentParams,
       flex: 2,
       minWidth: 220,
+    },
+    {
+      colId: "model",
+      field: "model",
+      headerName: "Model",
+      headerComponentParams: {
+        type: "Text",
+        tooltip: "Embedding model used to compute this row's results.",
+      } satisfies PlAgHeaderComponentParams,
+      flex: 1,
+      minWidth: 140,
     },
     {
       colId: "total",
@@ -122,21 +137,38 @@ const columnDefs = computed<ColDef<StatsRow>[]>(() => {
     },
   ];
 
-  // The current model length limit is shown in the header so the trim threshold
-  // is visible at a glance (and repeated in the info tooltip).
+  // Model-agnostic: the residue limit is PER MODEL (a run can mix models with
+  // different limits), so it isn't in the header — the count goes in "Trimmed" and the
+  // per-row limit in its own "Input Limit" column. Both appear only when at least one
+  // (scope, model) row actually truncated something.
   if (anyTrimmed.value) {
     cols.push({
       colId: "trimmed",
       field: "trimmed",
-      headerName: `Trimmed (>${maxResidues.value.toLocaleString()} aa)`,
+      headerName: "Trimmed",
       type: "numericColumn",
       valueFormatter: numFmt,
       headerComponentParams: {
         type: "Number",
-        tooltip: `Sequences longer than the model's ${maxResidues.value.toLocaleString()} amino-acid limit, truncated before embedding.`,
+        tooltip:
+          "Sequences longer than the model's input limit (see Input Limit), truncated before embedding.",
       } satisfies PlAgHeaderComponentParams,
       flex: 1,
-      minWidth: 160,
+      minWidth: 110,
+    });
+    cols.push({
+      colId: "inputLimit",
+      field: "maxResidues",
+      headerName: "Input Limit",
+      type: "numericColumn",
+      valueFormatter: numFmt,
+      headerComponentParams: {
+        type: "Number",
+        tooltip:
+          "This model's maximum input length in amino acids; longer sequences are truncated before embedding. Differs per model.",
+      } satisfies PlAgHeaderComponentParams,
+      flex: 1,
+      minWidth: 120,
     });
   }
 
@@ -149,7 +181,7 @@ const notReady = computed(
   () =>
     !isRunning.value &&
     (!hasInput.value ||
-      app.model.data.selectedScopes.length === 0 ||
+      app.model.data.embeddings.length === 0 ||
       !stats.value ||
       resultsStale.value),
 );
@@ -157,8 +189,8 @@ const notReady = computed(
 const notReadyText = computed(() => {
   if (!hasInput.value)
     return "Open Settings to select an input dataset and the sequences to embed.";
-  if (app.model.data.selectedScopes.length === 0)
-    return "Open Settings and choose which sequences to embed.";
+  if (app.model.data.embeddings.length === 0)
+    return "Open Settings and add at least one embedding.";
   if (resultsStale.value) return "Settings changed — press Run to update the results.";
   return "Press Run to compute embeddings.";
 });
