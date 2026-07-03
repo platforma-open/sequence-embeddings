@@ -34,15 +34,20 @@ ll := import("@platforma-sdk/workflow-tengo:ll")
 //                  ablang2 (seqcoding) and hf-custom peptideclm2 (own mean_pool).
 //   poolSpecials : include boundary special tokens in the mean (main.py
 //                  --pool-special-tokens). See per-model-embedding-extraction.md.
+//   maxLength    : max tokens incl. specials (main.py --max-length; residue cap =
+//                  maxLength − 2). Fitted per checkpoint from its config
 MODELS := {
-	"esm2-650M": { dim: 1280, label: "ESM-2 (650M)", inputKind: "aa", family: "hf", pairMode: "concat", embLayer: -2, poolSpecials: false },
-	"esm2-150M": { dim: 640, label: "ESM-2 (150M)", inputKind: "aa", family: "hf", pairMode: "concat", embLayer: -2, poolSpecials: false },
-	"currab": { dim: 1280, label: "CurrAb", inputKind: "aa", family: "hf", pairMode: "joint", embLayer: -1, poolSpecials: false },
-	"vhhbert": { dim: 768, label: "VHHBERT", inputKind: "aa", family: "hf", pairMode: "concat", embLayer: -1, poolSpecials: true },
-	"h3berta": { dim: 768, label: "H3BERTa", inputKind: "aa-cdr3-trimmed", family: "hf", pairMode: "concat", embLayer: -1, poolSpecials: true },
-	"tcr-bert": { dim: 768, label: "TCR-BERT", inputKind: "aa-spaced", family: "hf", pairMode: "concat", embLayer: 8, poolSpecials: false },
-	"peptideclm2": { dim: 1024, label: "PeptideCLM-2", inputKind: "smiles", family: "hf-custom", pairMode: "concat", embLayer: -2, poolSpecials: false },
-	"ablang2": { dim: 480, label: "AbLang2", inputKind: "aa", family: "ablang2", pairMode: "joint", embLayer: -2, poolSpecials: false }
+	"esm2-650M": { dim: 1280, label: "ESM-2 (650M)", inputKind: "aa", family: "hf", pairMode: "concat", embLayer: -2, poolSpecials: false, maxLength: 1024 },
+	"esm2-150M": { dim: 640, label: "ESM-2 (150M)", inputKind: "aa", family: "hf", pairMode: "concat", embLayer: -2, poolSpecials: false, maxLength: 1024 },
+	"currab": { dim: 1280, label: "CurrAb", inputKind: "aa", family: "hf", pairMode: "joint", embLayer: -1, poolSpecials: false, maxLength: 322 },
+	"vhhbert": { dim: 768, label: "VHHBERT", inputKind: "aa-spaced", family: "hf", pairMode: "concat", embLayer: -1, poolSpecials: true, maxLength: 183 },
+	"h3berta": { dim: 768, label: "H3BERTa", inputKind: "aa-cdr3-trimmed", family: "hf", pairMode: "concat", embLayer: -1, poolSpecials: true, maxLength: 100 },
+	"tcr-bert": { dim: 768, label: "TCR-BERT", inputKind: "aa-spaced", family: "hf", pairMode: "concat", embLayer: 8, poolSpecials: false, maxLength: 64 },
+	"peptideclm2": { dim: 1024, label: "PeptideCLM-2", inputKind: "smiles", family: "hf-custom", pairMode: "concat", embLayer: -2, poolSpecials: false, maxLength: 2048 },
+	// AbLang2: rotary, NO hard cap; seqcoding ignores --max-length. Set far above any
+	// conceivable input (effectively unbounded) so AbLang2 (which never truncates) is
+	// never falsely counted as truncated.
+	"ablang2": { dim: 480, label: "AbLang2", inputKind: "aa", family: "ablang2", pairMode: "joint", embLayer: -2, poolSpecials: false, maxLength: 10000 }
 }
 
 // Map an embedding task (user-facing model id + optional ESM-2 fidelity) to its

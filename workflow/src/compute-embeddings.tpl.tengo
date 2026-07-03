@@ -12,8 +12,9 @@
 //                    Xsv-imported and merged across batches by the orchestrator.
 // (The per-clonotype truncation flag is added with the report step.)
 //
-// Asset usage: model weights live in `support/assets-protein-embeddings/`
-// (esm2-650M, esm2-150M, currab, vhhbert).
+// Asset usage: model weights ship in the `protein-embeddings-assets` package,
+// one entrypoint per checkpoint (esm2-650M/150M, currab, vhhbert, h3berta,
+// tcr-bert, peptideclm-2, ablang2). The tag → asset branch is below.
 
 self := import("@platforma-sdk/workflow-tengo:tpl")
 ll := import("@platforma-sdk/workflow-tengo:ll")
@@ -86,6 +87,7 @@ self.body(func(inputs) {
 		arg("--model-family").arg(m.family).
 		arg("--pair-mode").arg(m.pairMode).
 		arg("--emb-layer").arg(string(m.embLayer)).
+		arg("--max-length").arg(string(m.maxLength)).
 		arg("--max-memory-gb").argExpr("{system.ram.gb}")
 
 	// Boundary specials kept in the mean only for models whose authors do so.

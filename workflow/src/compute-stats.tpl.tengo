@@ -70,6 +70,9 @@ self.body(func(inputs) {
 			// Each scope carries its own model so the report shows one row per
 			// (scope, model); fall back to the representative tag for safety.
 			model: is_undefined(sc.model) ? inputs.modelTag : sc.model,
+			// Per-model truncation cap, so n_truncated is counted against the same
+			// limit the embedding step used (0 → run_stats_only uses its default).
+			maxLength: is_undefined(sc.maxLength) ? 0 : sc.maxLength,
 			sourceColumns: sc.sourceColumns
 		})
 	}

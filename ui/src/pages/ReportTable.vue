@@ -20,10 +20,6 @@ const isRunning = computed(() => app.model.outputs.isRunning === true);
 const stats = computed<WorkflowStats | undefined>(() => app.model.outputs.stats);
 const resultsStale = computed(() => app.model.outputs.resultsStale === true);
 
-// The model's length cap in amino acids = its token limit (stats.max_length) minus
-// the 2 special tokens (<cls>/<eos>). Shown in the "Trimmed" column info tooltip.
-const maxResidues = computed(() => (stats.value?.max_length ?? 1024) - 2);
-
 // Columns are additive where it matters: Total = Successfully embedded + Skipped (no sequence)
 // (every input entity ends up in one of those two). Trimmed is a SUBSET of
 // Successfully embedded (an over-long sequence is truncated but still embedded),
@@ -37,6 +33,10 @@ type StatsRow = {
   embedded: number | undefined;
   dropped: number | undefined;
   trimmed: number | undefined;
+  // This row's model residue limit (its token cap minus the 2 specials). Per-model —
+  // the run can span models with different limits — so the threshold is per row, not
+  // a single column header. Undefined if the report didn't carry it.
+  maxResidues: number | undefined;
 };
 
 const rowData = computed<StatsRow[]>(() =>
@@ -56,6 +56,7 @@ const rowData = computed<StatsRow[]>(() =>
       embedded,
       dropped,
       trimmed: s.n_truncated,
+      maxResidues: typeof s.max_length === "number" ? s.max_length - 2 : undefined,
     };
   }),
 );
@@ -136,21 +137,38 @@ const columnDefs = computed<ColDef<StatsRow>[]>(() => {
     },
   ];
 
-  // The current model length limit is shown in the header so the trim threshold
-  // is visible at a glance (and repeated in the info tooltip).
+  // Model-agnostic: the residue limit is PER MODEL (a run can mix models with
+  // different limits), so it isn't in the header — the count goes in "Trimmed" and the
+  // per-row limit in its own "Input Limit" column. Both appear only when at least one
+  // (scope, model) row actually truncated something.
   if (anyTrimmed.value) {
     cols.push({
       colId: "trimmed",
       field: "trimmed",
-      headerName: `Trimmed (>${maxResidues.value.toLocaleString()} aa)`,
+      headerName: "Trimmed",
       type: "numericColumn",
       valueFormatter: numFmt,
       headerComponentParams: {
         type: "Number",
-        tooltip: `Sequences longer than the model's ${maxResidues.value.toLocaleString()} amino-acid limit, truncated before embedding.`,
+        tooltip:
+          "Sequences longer than the model's input limit (see Input Limit), truncated before embedding.",
       } satisfies PlAgHeaderComponentParams,
       flex: 1,
-      minWidth: 160,
+      minWidth: 110,
+    });
+    cols.push({
+      colId: "inputLimit",
+      field: "maxResidues",
+      headerName: "Input Limit",
+      type: "numericColumn",
+      valueFormatter: numFmt,
+      headerComponentParams: {
+        type: "Number",
+        tooltip:
+          "This model's maximum input length in amino acids; longer sequences are truncated before embedding. Differs per model.",
+      } satisfies PlAgHeaderComponentParams,
+      flex: 1,
+      minWidth: 120,
     });
   }
 

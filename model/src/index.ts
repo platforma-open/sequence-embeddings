@@ -96,9 +96,14 @@ export const platforma = BlockModelV3.create(blockDataModel)
       }
       seen.add(key);
     }
-    // Sort by (scope id, model) so a pure reorder of the card list doesn't change
-    // the args bytes and spuriously stale the block.
-    tasks.sort((a, b) => a.scope.id.localeCompare(b.scope.id) || a.model.localeCompare(b.model));
+    // Sort by (scope id, model, fidelity) so a pure reorder of the card list doesn't
+    // change the args bytes and spuriously stale the block.
+    tasks.sort(
+      (a, b) =>
+        a.scope.id.localeCompare(b.scope.id) ||
+        a.model.localeCompare(b.model) ||
+        (a.fidelity ?? "").localeCompare(b.fidelity ?? ""),
+    );
     return {
       inputAnchor: data.inputAnchor,
       embeddings: tasks,

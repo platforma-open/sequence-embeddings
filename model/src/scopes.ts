@@ -223,6 +223,11 @@ export function buildScopeConfig(
     defaultsInternal = scopes.filter((s) => s.feature === "scFv"); // scFv construct is the default
   } else if (fvAvailable) {
     defaultsInternal = scopes.filter((s) => s.feature === "Fv"); // prefer paired Fv
+  } else if (scopes.some((s) => s.feature === "peptide")) {
+    // Peptide input → seed the peptide scope(s). Peptide columns are not
+    // assembling-annotated, so they'd otherwise fall through to an empty default
+    // set; `recommendedModel` fills these with the peptide specialist (PeptideCLM-2).
+    defaultsInternal = scopes.filter((s) => s.feature === "peptide");
   } else {
     defaultsInternal = scopes.filter((s) => s.assembling); // assembly-trusted columns
     // same-chain CDR3+VDJRegion → keep VDJRegion, drop the redundant CDR3.

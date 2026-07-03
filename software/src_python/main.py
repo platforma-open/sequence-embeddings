@@ -115,6 +115,9 @@ class ScopePlan:
     is_heavy: bool = True       # IG heavy chain? (single-cell chain A, or bulk IGHeavy).
                                 # Drives AbLang2's heavy/light slot for single-chain scopes;
                                 # default True so non-IG / unspecified scopes act as heavy.
+    max_length: int = 0         # per-model truncation cap (tokens incl. specials) for the
+                                # stats-only count; 0 → fall back to args.max_length. The
+                                # embedding pass caps via --max-length (per task), not this.
 
 
 @dataclass(frozen=True)
@@ -134,6 +137,7 @@ def parse_plan(plan_path: Path) -> Plan:
             label=s.get("label", ""),
             model=s.get("model", ""),
             is_heavy=bool(s.get("isHeavy", True)),
+            max_length=int(s.get("maxLength", 0) or 0),
         )
         for s in raw["scopes"]
     ]
@@ -336,6 +340,7 @@ class Embedder:
         # truth — do not restate them here (they drift). PeptideCLM-2 (custom model)
         # ignores this and pools via its own mean_pool output.
         self.emb_layer = emb_layer
+        self._layer_logged = False   # one-time log of the pooled layer (see _forward_once)
         # Custom (trust_remote_code) models — PeptideCLM-2's ChemPepMTR — build their
         # own attention mask/bias and crash under fp16 SDPA on CUDA ("invalid dtype
         # for bias — should match query's dtype"). Keep them fp32 on every device;
@@ -461,6 +466,9 @@ class Embedder:
         #     skip our layer-select + masking entirely.
         mean_pool = getattr(out, "mean_pool", None)
         if mean_pool is not None:
+            if not self._layer_logged:
+                log_message("pooling: model's own mean_pool output (last layer, pad-masked)", "STEP")
+                self._layer_logged = True
             return mean_pool.float().cpu().numpy()
 
         # 3. Pick the model's recommended hidden layer (self.emb_layer), then mask
@@ -469,10 +477,22 @@ class Embedder:
         #    Custom models may not expose hidden_states, and a layer index out of
         #    range falls back to the final layer's last_hidden_state.
         hs = getattr(out, "hidden_states", None)
-        if hs is not None and -len(hs) <= self.emb_layer < len(hs):
+        in_range = hs is not None and -len(hs) <= self.emb_layer < len(hs)
+        if in_range:
             hidden = hs[self.emb_layer]
         else:
             hidden = out.last_hidden_state
+        # Log the pooled layer once per embedder, and flag a fall-back explicitly so a
+        # misconfigured --emb-layer (out of range for this model) is visible, not silent.
+        if not self._layer_logged:
+            n = len(hs) if hs is not None else 0
+            if in_range:
+                log_message(f"pooling hidden layer emb_layer={self.emb_layer} (of {n} hidden states)", "STEP")
+            else:
+                log_message(
+                    f"emb_layer={self.emb_layer} out of range for {n} hidden states — "
+                    "FALLING BACK to the last layer (last_hidden_state)", "WARNING")
+            self._layer_logged = True
         ids = enc["input_ids"]
         mask = enc["attention_mask"].clone()
         for sid in self.exclude_ids:              # drop <cls>/<eos>/<pad> positions
@@ -605,9 +625,10 @@ class ParallelEmbedder:
 class AbLang2Embedder:
     """AbLang2 (antibody) embedder. Unlike the HF-checkpoint models, AbLang2 ships
     its model CODE in the runenv (`ablang2` pip package) but fetches its WEIGHTS at
-    runtime from Zenodo. We ship those weights as an asset and, before loading,
-    place them into the package's `model-weights-ablang2-paired/` directory so
-    `pretrained()` finds them and loads OFFLINE (no network in the exec).
+    runtime from Zenodo. We ship those weights as an asset and load OFFLINE by pointing
+    `pretrained(model_to_use=<asset folder>)` straight at the mounted asset — AbLang2's
+    loader accepts a folder path (reads hparams.json + model.pt from it) for any name
+    that isn't a built-in. We do NOT copy into the package dir (read-only in the image).
 
     Same `embed`/`dim`/`dtype`/`max_length`/`close` interface as `Embedder`. Each
     sequence is encoded UNPAIRED as `[seq, ""]` in `seqcoding` mode → a 480-d vector;
@@ -622,34 +643,41 @@ class AbLang2Embedder:
 
     def __init__(self, model_path: str, device, max_length: int, token_budget: int,
                  input_kind: str = "aa") -> None:
-        import shutil
         import torch
         import ablang2
 
-        # Provision the asset weights into the pip package so pretrained() is offline.
-        pkg_dir = Path(ablang2.__file__).parent
-        weights_dir = pkg_dir / "model-weights-ablang2-paired"
-        weights_dir.mkdir(parents=True, exist_ok=True)
+        # Locate the AbLang2 weights (model.pt + hparams.json) inside the mounted asset dir;
+        # we load OFFLINE from that folder rather than by model name (see model_to_use below).
         src = Path(model_path)
-        for fn in ("model.pt", "hparams.json"):
-            dst = weights_dir / fn
-            if dst.exists():
-                continue
-            cand = src / fn
-            if not cand.exists():                      # asset may nest the files
-                found = list(src.rglob(fn))
-                cand = found[0] if found else None
-            if cand is None:
-                raise SystemExit(f"AbLang2 weight file {fn} not found under {model_path}")
-            shutil.copy(cand, dst)
+        weights_dir = None
+        if (src / "model.pt").exists() and (src / "hparams.json").exists():
+            weights_dir = src
+        else:
+            for p in src.rglob("model.pt"):
+                if (p.parent / "hparams.json").exists():
+                    weights_dir = p.parent
+                    break
+        if weights_dir is None:
+            raise SystemExit(
+                f"AbLang2 weights (model.pt + hparams.json) not found under {model_path}")
 
         self.device = device
         self.max_length = max_length
         self.dtype = torch.float32
         self.dim = self.DIM
         dev = "cuda" if device.type == "cuda" else "cpu"
+        # Load from the local asset folder, NOT the "ablang2-paired" name (which would try to
+        # download / write into site-packages). AbLang2 0.2.1 only treats model_to_use as a
+        # LOCAL folder when the string contains "ABLANG-" (its load_model gate:
+        # `elif "ABLANG-" in model_to_use`); a plain path like the mounted "model" dir hits its
+        # `assert False, "...does not exist"`. So expose the weights under an "ABLANG-"-named
+        # symlink and hand ablang2 that path (fetch_ablang2 then reads hparams.json + model.pt
+        # straight from the linked folder).
+        tagged = weights_dir.parent / ("ABLANG-" + weights_dir.name)
+        if not (tagged.is_symlink() or tagged.exists()):
+            tagged.symlink_to(weights_dir.resolve(), target_is_directory=True)
         self.model = ablang2.pretrained(
-            model_to_use="ablang2-paired", random_init=False, ncpu=1, device=dev)
+            model_to_use=str(tagged), random_init=False, ncpu=1, device=dev)
 
     def embed(self, sequences: list[str], is_light: bool = False) -> np.ndarray:
         if not sequences:
@@ -797,7 +825,7 @@ def resolve_chunk_size(args, dim: int, reserved_gb: float = 0.0) -> int:
 
 def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
                  chunk_size: int, model_name: str, key_col: str,
-                 pair_mode: str = "concat") -> list[dict]:
+                 pair_mode: str = "concat", input_kind: str = "aa") -> list[dict]:
     """Embed every selected scope in one pass over the keyspace, streaming each
     chunk's rows to a per-scope Parquet writer so peak RAM ~ chunk size (independent
     of N). Within a chunk each needed sequence column is embedded once and reused by
@@ -957,10 +985,29 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
                     for col, pred in col_pred.items():
                         present = cd.filter(pred)
                         keys = present[key_col].to_list()
+                        raw = present[col].to_list()
+                        # A per-model transform can turn a NON-empty raw sequence into
+                        # "" — an unparseable SMILES (RDKit failure) or a CDR3 that
+                        # trims to nothing. col_present ran on the RAW string (before
+                        # the transform), so those keys are still here. Drop them
+                        # rather than write a fabricated (zero / specials-only) vector;
+                        # count for the log. `aa`/`aa-spaced` never empty a non-empty
+                        # sequence, so this is a no-op for them.
+                        if input_kind != "aa" and keys:
+                            kept = [(k, s) for k, s in zip(keys, raw)
+                                    if prepare_sequence(s, input_kind) != ""]
+                            n_drop = len(keys) - len(kept)
+                            if n_drop:
+                                log_message(
+                                    f"{col}: dropped {n_drop} sequence(s) that became empty under "
+                                    f"'{input_kind}' (unparseable / fully trimmed) — no vector written",
+                                    "WARNING")
+                                keys = [k for k, _ in kept]
+                                raw = [s for _, s in kept]
                         # AbLang2 needs the chain's heavy/light slot; other embedders
                         # ignore extra kwargs (none passed).
                         kw = {"is_light": col in light_cols} if ablang2 else {}
-                        vecs = (embed_unique(present[col].to_list(), embedder, **kw) if keys
+                        vecs = (embed_unique(raw, embedder, **kw) if keys
                                 else np.zeros((0, embedder.dim), dtype=np.float32))
                         col_data[col] = (keys, vecs, {k: i for i, k in enumerate(keys)})
                     for sc in scopes:
@@ -1022,9 +1069,12 @@ def run_stats_only(args, plan: Plan, df: pl.DataFrame, model_name: str) -> int:
     """Compute the per-scope run-report counts over the full source and write
     stats.json. No model load, no embedding — a cheap counting pass invoked by the
     workflow alongside the batched embedding (which produces the actual vectors)."""
-    max_residues = args.max_length - 2
     scopes = []
     for sc in plan.scopes:
+        # Count truncation against THIS scope's model cap (per-model, threaded from
+        # the registry via the plan), so the report matches the embedding step; fall
+        # back to the run's --max-length when the plan omits it.
+        max_residues = (sc.max_length or args.max_length) - 2
         n_ent, n_drop, n_trunc = compute_scope_counts(df, sc.source_columns, max_residues)
         scopes.append({
             "name": sc.name,
@@ -1035,6 +1085,8 @@ def run_stats_only(args, plan: Plan, df: pl.DataFrame, model_name: str) -> int:
             # embedded by two models shows two report rows. Falls back to the
             # run's representative --model-name if the plan omitted it.
             "model": sc.model or model_name,
+            # Per-scope token cap → the UI's per-row "Trimmed (>N aa)" threshold.
+            "max_length": sc.max_length or args.max_length,
             "n_entities": n_ent,
             "n_dropped_empty": n_drop,
             "n_truncated": n_trunc,
@@ -1073,8 +1125,8 @@ def main() -> int:
                              "(required unless --stats-only)")
     parser.add_argument("--stats", required=True, help="Stats JSON path")
     parser.add_argument("--model-path", default=None,
-                        help="Mounted HF ESM-2 checkpoint directory — the exact model to use "
-                             "(required unless --stats-only)")
+                        help="Mounted checkpoint dir / asset — the exact model to use, per "
+                             "--model-family (required unless --stats-only)")
     parser.add_argument("--model-name", default=None,
                         help="Model identity for stats/logs (default: --model-path directory name)")
     parser.add_argument("--input-kind", default="aa",
@@ -1207,7 +1259,8 @@ def main() -> int:
 
     try:
         stats["scopes"] = stream_embed(plan, df, embedder, output_dir, chunk_size, model_name,
-                                       args.key_col, pair_mode=args.pair_mode)
+                                       args.key_col, pair_mode=args.pair_mode,
+                                       input_kind=args.input_kind)
     finally:
         embedder.close()
 

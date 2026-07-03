@@ -139,6 +139,9 @@ export type WorkflowScopeStats = {
   /** Human-readable picker label (e.g. "Heavy CDR3 aa Primary") for the UI report. */
   label: string;
   model: ModelTag;
+  /** This model's token cap (residue limit = max_length − 2) — per-model, so the
+   *  report's "Trimmed" threshold is correct per row. Absent until the report step. */
+  max_length?: number;
   /**
    * Per-scope counts. Optional: in batch mode they are aggregated post-run from the
    * batched outputs (the report step). Absent until then; the UI degrades gracefully.

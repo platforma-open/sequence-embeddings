@@ -1,6 +1,6 @@
 // Sequence Embeddings — workflow root (batch-processed).
 //
-// For each selected scope, runs the ESM-2 embedding step via
+// For each embedding task (scope × model), runs the embedding step via
 // `pframes.processColumn` in BATCH mode: the orchestrator splits the scope's
 // keyspace into batches of `batch.size` (capped by `batch.maxBatches`), renders
 // the `compute-embeddings` body per batch, and merges each batch's long-format
@@ -147,6 +147,7 @@ wf.body(func(args) {
 	for task in args.embeddings {
 		scope := task.scope
 		modelTag := models.resolveModelTag(task)
+		taskModel := models.get(modelTag)   // registry entry (maxLength etc.)
 
 		// Clean filename-safe scope name (feature[_chain]); the task name appends
 		// the model tag so the same scope embedded by two models/fidelities yields
@@ -271,6 +272,7 @@ wf.body(func(args) {
 			chain: scope.chain,
 			label: scope.label,
 			model: modelTag,
+			maxLength: taskModel.maxLength,   // per-model truncation cap for the count
 			sourceColumns: statsHeaders
 		})
 	}
