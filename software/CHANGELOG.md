@@ -1,5 +1,11 @@
 # @platforma-open/milaboratories.sequence-embeddings.software
 
+## 1.2.0
+
+### Minor Changes
+
+- 11d7d1f: Add new models
+
 ## 1.1.1
 
 ### Patch Changes
