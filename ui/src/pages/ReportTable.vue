@@ -175,22 +175,23 @@ const columnDefs = computed<ColDef<StatsRow>[]>(() => {
   return cols;
 });
 
+// The selection is incomplete until both a sequence and a model are chosen.
+const selectionIncomplete = computed(() => {
+  const sel = app.model.data.embedding;
+  return sel.scope === undefined || sel.model === undefined;
+});
+
 // notReady takes priority over loading, so it is gated on !isRunning to keep the
 // running animation visible during the (first) run.
 const notReady = computed(
   () =>
     !isRunning.value &&
-    (!hasInput.value ||
-      app.model.data.embeddings.length === 0 ||
-      !stats.value ||
-      resultsStale.value),
+    (!hasInput.value || selectionIncomplete.value || !stats.value || resultsStale.value),
 );
 
 const notReadyText = computed(() => {
-  if (!hasInput.value)
-    return "Open Settings to select an input dataset and the sequences to embed.";
-  if (app.model.data.embeddings.length === 0)
-    return "Open Settings and add at least one embedding.";
+  if (!hasInput.value) return "Open Settings to select an input dataset and the sequence to embed.";
+  if (selectionIncomplete.value) return "Open Settings and choose a sequence and a model to embed.";
   if (resultsStale.value) return "Settings changed — press Run to update the results.";
   return "Press Run to compute embeddings.";
 });

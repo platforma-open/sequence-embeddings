@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import type {
-  EmbeddingCard,
   EmbeddingModelId,
+  EmbeddingSelection,
   Fidelity,
   ScopeConfig,
 } from "@platforma-open/milaboratories.sequence-embeddings.model";
@@ -11,21 +11,24 @@ import {
   isCompatible,
 } from "@platforma-open/milaboratories.sequence-embeddings.model";
 import type { ListOption } from "@platforma-sdk/ui-vue";
-import { PlAlert, PlBtnGroup, PlDropdown } from "@platforma-sdk/ui-vue";
+import { PlBtnGroup, PlDropdown } from "@platforma-sdk/ui-vue";
 import { computed } from "vue";
 
-// The card is v-model'd from the PlElementList item; updates are immutable
-// replacements (new object) so the model's deep-watch tracks them cleanly.
-const card = defineModel<EmbeddingCard>({ required: true });
-// `duplicate`: this card repeats an earlier card's (sequence, model) — flagged by
-// MainPage. Shown as an inline error; the args lambda also throws, blocking Run.
-const props = defineProps<{ config: ScopeConfig; duplicate?: boolean }>();
+// The selection is v-model'd; updates are immutable replacements (new object) so
+// the model's deep-watch tracks them cleanly.
+const selection = defineModel<EmbeddingSelection>({ required: true });
+// `config` is OPTIONAL: the dropdowns render always (even before an input is
+// connected or while scopes resolve), just with empty options until it arrives.
+const props = defineProps<{ config?: ScopeConfig }>();
+
+// Every available scope for the connected input (empty until `config` resolves).
+const scopeOptions = computed(() => props.config?.options ?? []);
 
 // Models valid for the connected input: a model is offered (when no sequence is
 // chosen yet) iff it can embed at least one available scope.
 const inputModels = computed<EmbeddingModelId[]>(() => {
   const set = new Set<EmbeddingModelId>();
-  for (const o of props.config.options) {
+  for (const o of scopeOptions.value) {
     for (const m of compatibleModels(o.feature, o.isHeavy, o.receptor)) set.add(m);
   }
   return [...set].sort((a, b) => EMBEDDING_MODELS[b].priority - EMBEDDING_MODELS[a].priority);
@@ -33,13 +36,13 @@ const inputModels = computed<EmbeddingModelId[]>(() => {
 
 // Sequence dropdown
 const sequenceOptions = computed<ListOption<string>[]>(() =>
-  props.config.options.map((o) => ({ value: o.id, label: o.label })),
+  scopeOptions.value.map((o) => ({ value: o.id, label: o.label })),
 );
 
 // Model dropdown — sequence-first filtering: models that can embed the chosen
 // scope, or all input-valid models when no scope is chosen yet.
 const modelOptions = computed<ListOption<EmbeddingModelId>[]>(() => {
-  const s = card.value.scope;
+  const s = selection.value.scope;
   const ids = s ? compatibleModels(s.feature, s.isHeavy, s.receptor) : inputModels.value;
   return ids.map((id) => ({ value: id, label: EMBEDDING_MODELS[id].label }));
 });
@@ -50,40 +53,35 @@ const fidelityOptions: ListOption<Fidelity>[] = [
 ];
 
 function onSequence(id: string | undefined) {
-  const scope = props.config.options.find((o) => o.id === id);
+  const scope = scopeOptions.value.find((o) => o.id === id);
   if (scope === undefined) {
-    card.value = { ...card.value, scope: undefined };
+    selection.value = { ...selection.value, scope: undefined };
     return;
   }
   // Keep the model if it still fits the new scope; otherwise CLEAR it rather than
   // silently swapping in a default.
   const keep =
-    card.value.model !== undefined &&
-    isCompatible(scope.feature, scope.isHeavy, scope.receptor, card.value.model);
-  card.value = {
-    ...card.value,
+    selection.value.model !== undefined &&
+    isCompatible(scope.feature, scope.isHeavy, scope.receptor, selection.value.model);
+  selection.value = {
+    ...selection.value,
     scope,
-    model: keep ? card.value.model : undefined,
+    model: keep ? selection.value.model : undefined,
   };
 }
 
 function onModel(model: EmbeddingModelId | undefined) {
-  card.value = { ...card.value, model };
+  selection.value = { ...selection.value, model };
 }
 
 function onFidelity(fidelity: Fidelity) {
-  card.value = { ...card.value, fidelity };
+  selection.value = { ...selection.value, fidelity };
 }
 </script>
 
 <template>
-  <PlAlert v-if="duplicate" type="error">
-    This sequence and model combination is already added. Please, remove this embedding choice or
-    change its sequence or model.
-  </PlAlert>
-
   <PlDropdown
-    :model-value="card.scope?.id"
+    :model-value="selection.scope?.id"
     :options="sequenceOptions"
     label="Sequence to embed"
     required
@@ -95,7 +93,7 @@ function onFidelity(fidelity: Fidelity) {
   </PlDropdown>
 
   <PlDropdown
-    :model-value="card.model"
+    :model-value="selection.model"
     :options="modelOptions"
     label="Model"
     required
@@ -108,8 +106,8 @@ function onFidelity(fidelity: Fidelity) {
   </PlDropdown>
 
   <PlBtnGroup
-    v-if="card.model === 'esm2'"
-    :model-value="card.fidelity ?? 'standard'"
+    v-if="selection.model === 'esm2'"
+    :model-value="selection.fidelity ?? 'standard'"
     :options="fidelityOptions"
     label="Model fidelity"
     @update:model-value="onFidelity"
