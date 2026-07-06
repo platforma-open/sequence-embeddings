@@ -98,8 +98,8 @@ const slowOnCpu = computed(() => {
     <EmbeddingSelector v-model="app.model.data.embedding" :config="config" />
 
     <PlAlert v-if="slowOnCpu" type="warn">
-      <strong>Some selected models run best on a GPU — this machine has none.</strong>
-      They will run on the CPU and be substantially slower.
+      <strong>The selected model runs best on a GPU — this machine has none.</strong>
+      It will run on the CPU, which will be substantially slower.
     </PlAlert>
 
     <PlAccordionSection label="Advanced Settings">
