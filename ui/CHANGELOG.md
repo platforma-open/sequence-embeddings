@@ -1,5 +1,15 @@
 # @platforma-open/milaboratories.sequence-embeddings.ui
 
+## 1.2.1
+
+### Patch Changes
+
+- 77355b2: Change to single model selection
+- ee76c4a: Switch to single model selection
+- Updated dependencies [77355b2]
+- Updated dependencies [ee76c4a]
+  - @platforma-open/milaboratories.sequence-embeddings.model@1.2.1
+
 ## 1.2.0
 
 ### Minor Changes

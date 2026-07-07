@@ -1,5 +1,13 @@
 # @platforma-open/milaboratories.sequence-embeddings.workflow
 
+## 1.2.1
+
+### Patch Changes
+
+- ee76c4a: Switch to single model selection
+- Updated dependencies [ee76c4a]
+  - @platforma-open/milaboratories.sequence-embeddings.software@1.2.1
+
 ## 1.2.0
 
 ### Minor Changes
