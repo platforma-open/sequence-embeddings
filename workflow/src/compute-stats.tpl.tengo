@@ -25,13 +25,15 @@ soft := assets.importSoftware("@platforma-open/milaboratories.sequence-embedding
 self.validateInputs({
 	"__options__,closed": "",
 	cols: "any",            // MAP: header -> source column {spec,data}. Columns ride in a
-	                        // map, not an array — render rejects arrays that contain references.
+	// map, not an array — render rejects arrays that contain references.
 	scopes: "any",          // [{ name, feature, chain, label, model, sourceColumns: [header] }] (ref-free)
 	keyAxisSpec: "any",     // entity-key axis spec (for the TSV axis header)
 	keyCol: "string",       // entity-key column header (= batch-key axis name)
 	device: "string",       // "cpu" | "gpu" (recorded in the report)
 	modelTag: "string",     // representative model identity (top-level report field + --model-name);
-	                        // each scope carries its OWN model, which is what the per-row report uses
+	// each scope carries its OWN model, which is what the per-row report uses
+	inputKind: "string",    // the run's model sequence prep -> --input-kind (transform-aware counts)
+	pairMode: "string",     // "concat" | "joint" -> --pair-mode (joint = combined-length truncation)
 	"cpu,?": "number",      // metaInput — scheduling only, NOT in the content-ID
 	"mem,?": "number"       // metaInput (GiB) — scheduling only, NOT in the content-ID
 })
@@ -79,8 +81,6 @@ self.body(func(inputs) {
 	// Canonical encoding keeps the plan bytes deterministic.
 	planJson := string(canonical.encode({ device: inputs.device, scopes: planScopes }))
 
-	// --max-length omitted: main.py defaults it to the ESM-2 limit (the enforcer
-	// owns the constant) and writes it into stats for the UI truncation note.
 	run := exec.builder().
 		software(soft).
 		cpu(cpu).
@@ -92,6 +92,8 @@ self.body(func(inputs) {
 		arg("--plan").arg("plan.json").
 		arg("--key-col").arg(inputs.keyCol).
 		arg("--model-name").arg(inputs.modelTag).
+		arg("--input-kind").arg(inputs.inputKind).
+		arg("--pair-mode").arg(inputs.pairMode).
 		arg("--stats").arg("stats.json").
 		saveFileContent("stats.json").
 		printErrStreamToStdout().

@@ -63,7 +63,7 @@ scopeDomain := func(scope) {
 //     feature:  string,   // "peptide" | "CDR3" | "VDJRegion" | "Fv" | "scFv"
 //     chain:    string,   // "A" | "B" | "" (peptide / Fv / scFv)
 //     label:    string,   // native picker label, e.g. "Heavy CDR3 aa Primary"
-//     model:    string    // "esm2-650M" | "esm2-150M"
+//     model:    string    // checkpoint tag (any ModelTag; see models.lib MODELS)
 //   }
 
 // Xsv output `settings` for the scope's embedding column. `keyAxisName` is the

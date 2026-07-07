@@ -167,16 +167,15 @@ def resolve_device(requested: str):
         return torch.device("cpu")
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if requested == "gpu":
-        log_message("device 'gpu' requested but CUDA is unavailable at runtime; "
-                    "running the mounted checkpoint on CPU (fp32). Throughput will be lower.",
-                    "WARNING")
-    # Apple Silicon's Metal backend
+    # CUDA unavailable: fall back to Apple Silicon's Metal (MPS) if present, else CPU. Decide the
+    # device FIRST so the warning names what actually runs.
     mps = getattr(torch.backends, "mps", None)
-    if mps is not None and mps.is_available():
-        return torch.device("mps")
-
-    return torch.device("cpu")
+    fallback = torch.device("mps") if (mps is not None and mps.is_available()) else torch.device("cpu")
+    if requested == "gpu":
+        log_message(f"device 'gpu' requested but CUDA is unavailable at runtime; running the "
+                    f"mounted checkpoint on {fallback.type.upper()} (fp32). Throughput will be "
+                    "lower than on a CUDA GPU.", "WARNING")
+    return fallback
 
 
 # --- parallelism sizing -----------------------------------------------------
@@ -261,8 +260,10 @@ def prepare_sequence(seq: str, input_kind: str) -> str:
         loop, but MiXCR's CDR3 includes the conserved anchors (`C…W`/`F`). Strip a
         leading Cys and a trailing Trp/Phe — only when present, so a non-canonical
         CDR3 keeps every residue rather than silently losing one.
-      - `"aa-spaced"` (TCR-BERT): its tokenizer expects residues space-separated
-        (`"C A S S ..."`) so the WordPiece splitter sees one token per residue.
+      - `"aa-spaced"` (TCR-BERT, VHHBERT): their tokenizers expect residues space-separated
+        (`"C A S S ..."`) so the WordPiece splitter sees one token per residue. VHHBERT's slow
+        BertTokenizer (`do_basic_tokenize=false`, single-letter vocab, no `##`) otherwise collapses
+        the whole sequence to one `<unk>` — an identical vector for every input.
       - `"smiles"` (PeptideCLM-2): the model reads molecules, not residues, so the
         peptide AA string is converted to a SMILES string via RDKit. A sequence
         RDKit cannot parse (non-standard residues) yields "" → an ~zero embedding,
@@ -646,6 +647,14 @@ class AbLang2Embedder:
         import torch
         import ablang2
 
+        # AbLang2 embeds raw AA via its own seqcoding: it applies NO prepare_sequence transform and
+        # does its own batching. So input_kind must be "aa" (a non-"aa" kind would silently embed the
+        # untransformed sequence), and token_budget is accepted only for signature parity with the HF
+        # embedders — intentionally unused here. Assert rather than let a misconfiguration pass silently.
+        assert input_kind == "aa", (
+            f"AbLang2Embedder applies no input transform; got input_kind={input_kind!r}. "
+            "Its models.lib registry entry must keep inputKind='aa'.")
+
         # Locate the AbLang2 weights (model.pt + hparams.json) inside the mounted asset dir;
         # we load OFFLINE from that folder rather than by model name (see model_to_use below).
         src = Path(model_path)
@@ -739,28 +748,72 @@ def col_present(col: str):
     return pl.col(col).is_not_null() & (pl.col(col) != "")
 
 
-def compute_scope_counts(df: pl.DataFrame, source_columns: list[str], max_residues: int):
-    """Per-scope (n_entities, n_dropped_empty, n_truncated) over the FULL keyspace,
-    one vectorised pass — no embedding. Standalone twin of stream_embed's per-batch
-    scope_stats, used by the --stats-only report pass.
+def compute_scope_counts(df: pl.DataFrame, source_columns: list[str], max_residues: int,
+                         input_kind: str = "aa", is_joint: bool = False):
+    """Per-scope (n_entities, n_dropped_empty, n_truncated) over the FULL keyspace.
+    Single source of truth for the run-report counts — stream_embed's scope_stats delegates
+    here so the embedding and --stats-only paths always agree.
 
-    n_entities = rows with every source column present (non-empty); n_dropped_empty =
-    the rest; n_truncated = present rows whose sequence exceeds the token limit
-    (counted once per long chain, summed across columns for paired Fv)."""
+    n_entities = rows that will actually be EMBEDDED: every source column present (non-empty)
+    AND surviving the per-model input transform. A `smiles`/`aa-cdr3-trimmed` transform can turn
+    a non-empty raw sequence into "" (unparseable SMILES / fully-trimmed CDR3); those rows are
+    dropped at embed time, so they must NOT be counted as embedded (`aa`/`aa-spaced` never empty
+    a sequence). n_dropped_empty = the rest.
+    n_truncated = present rows over the token budget. For a JOINT pair the chains are tokenized
+    TOGETHER (H<sep>L), so it is the COMBINED length (all chains' residues + one separator per
+    join); otherwise each chain is embedded on its own → count per chain and sum. It is None (N/A)
+    for `smiles`: PeptideCLM-2 tokenizes the AA→SMILES string, not residues, so an AA-length count
+    is meaningless and SMILES-token truncation can't be predicted here (no tokenizer)."""
+    smiles = input_kind == "smiles"
     if not all(c in df.columns for c in source_columns):
-        return 0, df.height, 0
+        return 0, df.height, (None if smiles else 0)
     pred = col_present(source_columns[0])
     for c in source_columns[1:]:
         pred = pred & col_present(c)
-    aggs = [pred.cast(pl.Int64).sum().alias("n_ent")]
-    for i, c in enumerate(source_columns):
-        aggs.append(
-            (pred & (pl.col(c).str.len_chars() > max_residues)).cast(pl.Int64).sum().alias(f"t{i}")
+
+    # --- truncation ---
+    if smiles:
+        n_trunc = None   # AA length ≠ SMILES-token count → N/A (see docstring)
+    elif is_joint:
+        total_len = pl.lit(len(source_columns) - 1)   # separators between the joined chains
+        for c in source_columns:
+            total_len = total_len + pl.col(c).str.len_chars()
+        n_trunc = int(df.select((pred & (total_len > max_residues)).cast(pl.Int64).sum()).item() or 0)
+    else:
+        aggs = [(pred & (pl.col(c).str.len_chars() > max_residues)).cast(pl.Int64).sum().alias(f"t{i}")
+                for i, c in enumerate(source_columns)]
+        n_trunc = sum(int(x or 0) for x in df.select(aggs).row(0))
+
+    # --- embeddable rows (transform-aware) ---
+    n_present = int(df.select(pred.cast(pl.Int64).sum()).item() or 0)
+    if input_kind == "aa" or n_present == 0:
+        n_ent = n_present   # aa/aa-spaced never empty a sequence → stays fully vectorised
+    else:
+        # A transform can empty a sequence; a row is embedded only if EVERY source chain
+        # survives. Materialise only the present rows (these models — PeptideCLM-2 smiles,
+        # H3BERTa cdr3-trim — are short single-chain scopes, so this stays cheap).
+        present = df.filter(pred).select(source_columns)
+        cols = [present[c].to_list() for c in source_columns]
+        n_ent = sum(
+            1 for i in range(present.height)
+            if all(prepare_sequence(cols[j][i], input_kind) != "" for j in range(len(source_columns)))
         )
-    row = df.select(aggs).row(0)
-    n_ent = int(row[0] or 0)
-    n_trunc = sum(int(x or 0) for x in row[1:])
     return n_ent, df.height - n_ent, n_trunc
+
+
+def _warn_nonfinite(vecs: np.ndarray) -> np.ndarray:
+    """Flag NaN/Inf in produced vectors (no embedding should be non-finite). An fp16-on-CUDA
+    overflow or a degenerate row would otherwise write silently-poisonous values to Parquet and
+    corrupt downstream clustering / Sequence-Space with no trace. Log a WARNING with the count
+    rather than fabricate a replacement (a zero vector is just as corrupting) — the run stays
+    visible instead of silently wrong. Applied at the two embed chokepoints, so it covers every
+    embedder (hf / hf-custom / ablang2)."""
+    if vecs.size:
+        n_bad = int((~np.isfinite(vecs)).any(axis=1).sum())
+        if n_bad:
+            log_message(f"{n_bad} of {len(vecs)} embedding vector(s) contain NaN/Inf "
+                        "(fp16 overflow or degenerate input) — written as-is; investigate", "WARNING")
+    return vecs
 
 
 def embed_unique(seqs: list[str], embedder, **embed_kwargs) -> np.ndarray:
@@ -771,7 +824,7 @@ def embed_unique(seqs: list[str], embedder, **embed_kwargs) -> np.ndarray:
     if not seqs:
         return np.zeros((0, embedder.dim), dtype=np.float32)
     uniq = list(dict.fromkeys(seqs))            # distinct, first-appearance order
-    vecs = embedder.embed(uniq, **embed_kwargs)  # (U, D)
+    vecs = _warn_nonfinite(embedder.embed(uniq, **embed_kwargs))  # (U, D)
     pos = {s: i for i, s in enumerate(uniq)}
     return vecs[[pos[s] for s in seqs]]         # scatter back to input order
 
@@ -782,7 +835,7 @@ def embed_pairs_unique(pairs: list[tuple[str, str]], embedder) -> np.ndarray:
     if not pairs:
         return np.zeros((0, embedder.dim), dtype=np.float32)
     uniq = list(dict.fromkeys(pairs))           # distinct pairs, first-appearance order
-    vecs = embedder.embed_pairs(uniq)           # (U, D)
+    vecs = _warn_nonfinite(embedder.embed_pairs(uniq))           # (U, D)
     pos = {p: i for i, p in enumerate(uniq)}
     return vecs[[pos[p] for p in pairs]]        # scatter back to input order
 
@@ -895,32 +948,24 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
         if len(sc.source_columns) == 1 and not sc.is_heavy
     }
     ablang2 = isinstance(embedder, AbLang2Embedder)
+    # AbLang2's slot-based heavy/light routing is correct only while its Fv scopes take the 
+    # native JOINT path (emit_joint), never the per-column concat path.
+    assert not (ablang2 and fv_pairs), (
+        "AbLang2 concat-Fv is unsupported: the light chain would be embedded in the heavy slot "
+        "(light_cols covers single chains only). Keep AbLang2 pairMode='joint', or extend light_cols "
+        "to Fv light chains before enabling concat-Fv for AbLang2.")
 
     max_residues = embedder.max_length - 2
 
     def scope_stats(sc: ScopePlan):
-        """ how many rows will be embedded, how many are dropped, and how many will be truncated
-        (n_entities, n_dropped, n_truncated) — one vectorised pass, no materialisation."""
+        """(n_entities, n_dropped, n_truncated) for one scope. Delegates to the module-level
+        compute_scope_counts (single source of truth) so the embedding and --stats-only paths
+        report identically — passing input_kind (transform-aware drop) and is_joint (combined
+        truncation for a jointly-tokenised pair)."""
         if not viable(sc):
             return 0, 0, 0
-        pred = col_present(sc.source_columns[0])
-        for c in sc.source_columns[1:]:
-            pred = pred & col_present(c)
-        # All aggregations in a single select: eligible-row count + one truncation
-        # count per source column (a row counts once per long chain, as before).
-        # eligible-row count
-        aggs = [pred.cast(pl.Int64).sum().alias("n_ent")]
-        # one truncation count per source column
-        for i, c in enumerate(sc.source_columns):
-            aggs.append(
-                (pred & (pl.col(c).str.len_chars() > max_residues)).cast(pl.Int64).sum().alias(f"t{i}")
-            )
-        row = df.select(aggs).row(0) # (n_ent, t0[, t1])
-        # Eligible rows, or 0 guards the empty-df case where sum is None
-        n_ent = int(row[0] or 0)
-        # sum of the per-column truncation counts. For Fv this is t0 + t1
-        n_trunc = sum(int(x or 0) for x in row[1:])
-        return n_ent, df.height - n_ent, n_trunc
+        return compute_scope_counts(df, sc.source_columns, max_residues,
+                                    input_kind=input_kind, is_joint=is_joint(sc))
 
     stat = {sc.name: scope_stats(sc) for sc in scopes}
     # Output width: a joint pair is one D-vector; otherwise D per source column
@@ -1055,7 +1100,7 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
         if n_ent:
             log_message(f"scope {disp}: {n_ent} embedded, dim={out_dim[sc.name]}"
                         + (f", {n_drop} dropped (empty/partial)" if n_drop else "")
-                        + (f", {n_trunc} truncated >{embedder.max_length} tokens" if n_trunc else ""))
+                        + (f", {n_trunc} truncated >{max_residues} aa" if n_trunc else ""))
         else:
             log_message(f"scope {disp}: no sequences to embed ({n_drop} dropped); "
                         "wrote empty (header-only) output", "WARNING")
@@ -1075,7 +1120,10 @@ def run_stats_only(args, plan: Plan, df: pl.DataFrame, model_name: str) -> int:
         # the registry via the plan), so the report matches the embedding step; fall
         # back to the run's --max-length when the plan omits it.
         max_residues = (sc.max_length or args.max_length) - 2
-        n_ent, n_drop, n_trunc = compute_scope_counts(df, sc.source_columns, max_residues)
+        sc_is_joint = args.pair_mode == "joint" and len(sc.source_columns) == 2
+        n_ent, n_drop, n_trunc = compute_scope_counts(
+            df, sc.source_columns, max_residues,
+            input_kind=args.input_kind, is_joint=sc_is_joint)
         scopes.append({
             "name": sc.name,
             "feature": sc.feature,
@@ -1094,8 +1142,12 @@ def run_stats_only(args, plan: Plan, df: pl.DataFrame, model_name: str) -> int:
         log_message(f"scope {sc.label or sc.name}: {n_ent} embedded"
                     + (f", {n_drop} dropped (empty/partial)" if n_drop else "")
                     + (f", {n_trunc} truncated >{max_residues} aa" if n_trunc else ""))
+    # Resolve the device as the embedding pass does, so the report shows what actually ran
+    # (cpu/cuda/mps), not just what was requested.
+    device = resolve_device(plan.device)
     stats = {
-        "device_used": plan.device,
+        "device_requested": plan.device,
+        "device_used": device.type,
         "model": model_name,
         "max_length": args.max_length,
         "scopes": scopes,

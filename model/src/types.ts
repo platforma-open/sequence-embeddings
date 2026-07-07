@@ -112,20 +112,30 @@ export type ScopeConfig = {
 };
 
 /**
- * One embedding card in the settings list: a (sequence scope, model) task the
- * user assembles. `scope` and `model` are each undefined until picked — the UI
- * fills one and bidirectionally filters the other. `fidelity` applies only when
- * `model` is ESM-2.
+ * The single (sequence scope, model) selection the user assembles. `scope` and
+ * `model` are each undefined until picked — the UI fills one and bidirectionally
+ * filters the other. `fidelity` applies only when `model` is ESM-2. Always present
+ * in `BlockData` (initialised to `{}`); the args lambda wraps it into the workflow's
+ * 1-element task list, so the workflow's list contract is unchanged.
  */
-export type EmbeddingCard = {
-  /** Stable card key for the `PlElementList` (`get-item-key`). */
-  id: string;
+export type EmbeddingSelection = {
   scope?: SelectedScope;
   model?: EmbeddingModelId;
   /** ESM-2 fidelity; ignored for other models. */
   fidelity?: Fidelity;
-  /** UI: card expanded in the list. */
-  isExpanded?: boolean;
+};
+
+/**
+ * Frozen V2 card shape (per-card model selection, before the single-selection
+ * redesign). Kept only as the migration source type so `BlockDataV2` stays
+ * historically accurate; new code uses `EmbeddingSelection`. `id` was the stable
+ * key for V2's `PlElementList`; dropped in V3.
+ */
+export type EmbeddingCardV2 = {
+  id: string;
+  scope?: SelectedScope;
+  model?: EmbeddingModelId;
+  fidelity?: Fidelity;
 };
 
 /**
@@ -149,8 +159,10 @@ export type WorkflowScopeStats = {
   n_entities?: number;
   /** Clones dropped before inference (empty or partial sequence for this scope). */
   n_dropped_empty?: number;
-  /** Sequences truncated from the C-terminus for exceeding the token limit. */
-  n_truncated?: number;
+  /** Sequences truncated from the C-terminus for exceeding the token limit. `null` = N/A:
+   *  SMILES models (PeptideCLM-2) tokenize the AA→SMILES string, not residues, so an
+   *  AA-length truncation count is meaningless and isn't reported. */
+  n_truncated?: number | null;
 };
 
 /**
@@ -158,7 +170,10 @@ export type WorkflowScopeStats = {
  * computed" summary on the block UI and to surface device routing decisions.
  */
 export type WorkflowStats = {
-  device_used: "cpu" | "gpu";
+  /** Device the run actually executed on, resolved from the request (a torch device type). */
+  device_used: "cpu" | "cuda" | "mps";
+  /** Device the workflow requested, before runtime availability resolution. */
+  device_requested?: "cpu" | "gpu";
   /** The single model loaded for the run (chosen by device tier). */
   model: ModelTag;
   /**
@@ -200,18 +215,16 @@ export type BlockDataV1 = {
 };
 
 /**
- * V2 BlockData. Model selection moves per-scope: the global `fidelity` + flat
- * `selectedScopes` become a list of embedding cards, each a (scope, model,
- * fidelity?) task. Enables specialist models and same-scope model comparison.
+ * V2 BlockData. Frozen migration source: model selection moved per-scope — the
+ * global `fidelity` + flat `selectedScopes` became a list of embedding cards, each
+ * a (scope, model, fidelity?) task. V3 collapses this list to a single selection.
  */
 export type BlockDataV2 = {
   inputAnchor?: PlRef;
-  /** The embedding cards (scope × model tasks) the user has assembled. */
-  embeddings: EmbeddingCard[];
+  /** The embedding cards (scope × model tasks) the user assembled. */
+  embeddings: EmbeddingCardV2[];
   /**
    * Init-guard: canonical id of the anchor whose default cards were last seeded.
-   * Prevents re-seeding on panel reopen / server patch; triggers re-seed +
-   * reconciliation on input change.
    */
   embeddingsInitializedForAnchor?: string;
   /** Advanced resource overrides (GiB / cores); undefined → workflow defaults. */
@@ -220,12 +233,34 @@ export type BlockDataV2 = {
   defaultBlockLabel?: string;
 };
 
+/**
+ * V3 BlockData. The card list collapses to a single (scope, model) selection: the
+ * block embeds ONE combination per run. `embedding` is always present (init `{}`);
+ * the args lambda wraps it into the workflow's 1-element task list, so the workflow
+ * contract is unchanged.
+ */
+export type BlockDataV3 = {
+  inputAnchor?: PlRef;
+  /** The single (scope, model, fidelity?) selection the user assembles. */
+  embedding: EmbeddingSelection;
+  /**
+   * Init-guard: canonical id of the anchor whose default selection was last seeded.
+   * Prevents re-seeding on panel reopen / server patch; triggers a re-seed on
+   * input change.
+   */
+  embeddingInitializedForAnchor?: string;
+  /** Advanced resource overrides (GiB / cores); undefined → workflow defaults. */
+  mem?: number;
+  cpu?: number;
+  defaultBlockLabel?: string;
+};
+
 /** Current BlockData shape. */
-export type BlockData = BlockDataV2;
+export type BlockData = BlockDataV3;
 
 /**
  * One embedding task in the workflow input: a scope plus the model to embed it
- * with (and ESM-2 fidelity, when applicable). Projected from `BlockData.embeddings`.
+ * with (and ESM-2 fidelity, when applicable). Projected from `BlockData.embedding`.
  */
 export type EmbeddingTask = {
   scope: SelectedScope;
@@ -236,13 +271,13 @@ export type EmbeddingTask = {
 
 /**
  * Workflow input shape. Args projection in `index.ts` builds this from
- * `BlockData`, validating that `inputAnchor` is set and every card is a complete,
+ * `BlockData`, validating that `inputAnchor` is set and the selection is a complete,
  * compatible (scope, model) pair (throws otherwise — the V3 idiom replaces V1's
  * `.argsValid()`).
  */
 export type BlockArgs = {
   inputAnchor: PlRef;
-  /** Tasks to emit, projected from `data.embeddings` (validated complete + compatible). */
+  /** Tasks to emit — a 1-element list projected from `data.embedding` (validated complete + compatible). */
   embeddings: EmbeddingTask[];
   /** Advanced resource overrides for the embedding step (GiB / cores); undefined → workflow defaults. */
   mem?: number;

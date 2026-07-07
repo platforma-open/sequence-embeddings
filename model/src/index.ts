@@ -1,6 +1,6 @@
 import type { InferOutputsType } from "@platforma-sdk/model";
 import { BlockModelV3, PColumnCollection } from "@platforma-sdk/model";
-import { isCompatible } from "./compat";
+import { EMBEDDING_MODELS, isCompatible } from "./compat";
 import { blockDataModel } from "./dataModel";
 import { buildScopeConfig, resolveReceptor, SEQUENCE_SELECTORS } from "./scopes";
 import type { BlockArgs, EmbeddingTask, ScopeConfig, WorkflowStats } from "./types";
@@ -14,8 +14,9 @@ export type {
   BlockData,
   BlockDataV1,
   BlockDataV2,
-  EmbeddingCard,
+  BlockDataV3,
   EmbeddingModelId,
+  EmbeddingSelection,
   EmbeddingTask,
   Fidelity,
   ModelTag,
@@ -64,49 +65,28 @@ export const platforma = BlockModelV3.create(blockDataModel)
     if (data.inputAnchor === undefined) {
       throw new Error("Select an input dataset");
     }
-    if (data.embeddings.length === 0) {
-      throw new Error("Add at least one embedding");
+    // Single selection: `data.embedding` is the one (scope, model) the user
+    // assembled. Project it to one task, validating the pair is complete and
+    // compatible — data-only (scope carries feature/isHeavy/receptor snapshots), so
+    // the lambda stays pure (the V3 idiom replacing V1's .argsValid()). Emitted as a
+    // 1-element list: the workflow input contract is a task list, left unchanged by
+    // the single-selection UI.
+    const sel = data.embedding;
+    if (sel.scope === undefined) throw new Error("Select a sequence to embed");
+    if (sel.model === undefined) throw new Error("Select a model");
+    if (!isCompatible(sel.scope.feature, sel.scope.isHeavy, sel.scope.receptor, sel.model)) {
+      throw new Error(`${sel.model} cannot embed "${sel.scope.label}"`);
     }
-    // Project each card to a (scope, model) task. Validate each card is complete
-    // and the pair is compatible — data-only (scope carries feature/isHeavy/
-    // receptor snapshots), so the lambda stays pure (the V3 idiom replacing
-    // V1's .argsValid()).
-    const tasks = data.embeddings.map((card): EmbeddingTask => {
-      if (card.scope === undefined) throw new Error("Each embedding needs a sequence selected");
-      if (card.model === undefined) throw new Error("Each embedding needs a model selected");
-      if (!isCompatible(card.scope.feature, card.scope.isHeavy, card.scope.receptor, card.model)) {
-        throw new Error(`${card.model} cannot embed "${card.scope.label}"`);
-      }
-      return {
-        scope: card.scope,
-        model: card.model,
-        // Fidelity applies only to ESM-2; drop it for other models so it doesn't
-        // perturb the args bytes.
-        fidelity: card.model === "esm2" ? (card.fidelity ?? "standard") : undefined,
-      };
-    });
-    // Reject exact-duplicate tasks (same scope + model + effective fidelity).
-    const seen = new Set<string>();
-    for (const t of tasks) {
-      const key = `${t.scope.id}|${t.model}|${t.fidelity ?? ""}`;
-      if (seen.has(key)) {
-        throw new Error(
-          `"${t.scope.label}" is already being embedded with this model — remove the duplicate embedding.`,
-        );
-      }
-      seen.add(key);
-    }
-    // Sort by (scope id, model, fidelity) so a pure reorder of the card list doesn't
-    // change the args bytes and spuriously stale the block.
-    tasks.sort(
-      (a, b) =>
-        a.scope.id.localeCompare(b.scope.id) ||
-        a.model.localeCompare(b.model) ||
-        (a.fidelity ?? "").localeCompare(b.fidelity ?? ""),
-    );
+    const task: EmbeddingTask = {
+      scope: sel.scope,
+      model: sel.model,
+      // Fidelity applies only to ESM-2; drop it for other models so it doesn't
+      // perturb the args bytes.
+      fidelity: sel.model === "esm2" ? (sel.fidelity ?? "standard") : undefined,
+    };
     return {
       inputAnchor: data.inputAnchor,
-      embeddings: tasks,
+      embeddings: [task],
       mem: data.mem,
       cpu: data.cpu,
     };
@@ -117,15 +97,10 @@ export const platforma = BlockModelV3.create(blockDataModel)
   // Dropdown source for the input picker. Refs returned here populate the UI
   // selector; the user's pick is written back into `data.inputAnchor`.
   .output("inputOptions", (ctx) => ctx.resultPool.getOptions(inputAnchorSpecs))
-  // Spec for the currently selected ref. UI uses this to display the dataset
-  // shape (axis names, domain) and to gate subtitle / status text.
-  .output("inputSpec", (ctx) =>
-    ctx.data.inputAnchor ? ctx.resultPool.getPColumnSpecByRef(ctx.data.inputAnchor) : undefined,
-  )
   // Scope picker config — derived from the connected input's sequence columns.
-  // `options` feeds each card's sequence dropdown; `defaults` (+ receptor/paired)
-  // seed the cards on first connection. The UI snapshots a chosen scope (column
-  // id(s), feature, isHeavy, receptor) into the card so the args lambda stays
+  // `options` feeds the sequence dropdown; `defaults` (+ receptor/paired) seed the
+  // selection on first connection. The UI snapshots a chosen scope (column id(s),
+  // feature, isHeavy, receptor) into the selection so the args lambda stays
   // data-only. retentive: avoid the picker flickering empty while the pool re-resolves.
   .output(
     "availableScopes",
@@ -186,7 +161,17 @@ export const platforma = BlockModelV3.create(blockDataModel)
   // stream. Diagnostics come from the run report; batch errors surface via the
   // block's error panel.
   .title(() => "Sequence Embeddings")
-  .subtitle((ctx) => ctx.data.defaultBlockLabel ?? "")
+  // Subtitle: input dataset · sequence scope · model — each part appended as it is
+  // picked. Pure derivation from `data` (no output read, no data write), so it
+  // recomputes reactively without a hairpin.
+  .subtitle((ctx) => {
+    const parts: string[] = [];
+    if (ctx.data.defaultBlockLabel) parts.push(ctx.data.defaultBlockLabel);
+    const sel = ctx.data.embedding;
+    if (sel.scope?.label) parts.push(sel.scope.label);
+    if (sel.model) parts.push(EMBEDDING_MODELS[sel.model].label);
+    return parts.join(" · ");
+  })
   .sections(() => [{ type: "link", href: "/", label: "Main" }])
   .done();
 

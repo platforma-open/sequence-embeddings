@@ -32,7 +32,8 @@ type StatsRow = {
   total: number | undefined;
   embedded: number | undefined;
   dropped: number | undefined;
-  trimmed: number | undefined;
+  // number = count; null = N/A (SMILES models don't track residue truncation); undefined = not yet reported.
+  trimmed: number | null | undefined;
   // This row's model residue limit (its token cap minus the 2 specials). Per-model —
   // the run can span models with different limits — so the threshold is per row, not
   // a single column header. Undefined if the report didn't carry it.
@@ -56,7 +57,10 @@ const rowData = computed<StatsRow[]>(() =>
       embedded,
       dropped,
       trimmed: s.n_truncated,
-      maxResidues: typeof s.max_length === "number" ? s.max_length - 2 : undefined,
+      // SMILES models report n_truncated = null (N/A) — they tokenize the AA→SMILES string,
+      // not residues, so a residue "Input Limit" is meaningless → show "—" for those rows too.
+      maxResidues:
+        s.n_truncated !== null && typeof s.max_length === "number" ? s.max_length - 2 : undefined,
     };
   }),
 );
@@ -165,7 +169,7 @@ const columnDefs = computed<ColDef<StatsRow>[]>(() => {
       headerComponentParams: {
         type: "Number",
         tooltip:
-          "This model's maximum input length in amino acids; longer sequences are truncated before embedding. Differs per model.",
+          "This model's maximum input length in amino acids; longer sequences are truncated before embedding. Differs per model, and shows “—” for models that don't tokenize residues (e.g. PeptideCLM-2, which embeds an AA→SMILES string).",
       } satisfies PlAgHeaderComponentParams,
       flex: 1,
       minWidth: 120,
@@ -175,22 +179,23 @@ const columnDefs = computed<ColDef<StatsRow>[]>(() => {
   return cols;
 });
 
+// The selection is incomplete until both a sequence and a model are chosen.
+const selectionIncomplete = computed(() => {
+  const sel = app.model.data.embedding;
+  return sel.scope === undefined || sel.model === undefined;
+});
+
 // notReady takes priority over loading, so it is gated on !isRunning to keep the
 // running animation visible during the (first) run.
 const notReady = computed(
   () =>
     !isRunning.value &&
-    (!hasInput.value ||
-      app.model.data.embeddings.length === 0 ||
-      !stats.value ||
-      resultsStale.value),
+    (!hasInput.value || selectionIncomplete.value || !stats.value || resultsStale.value),
 );
 
 const notReadyText = computed(() => {
-  if (!hasInput.value)
-    return "Open Settings to select an input dataset and the sequences to embed.";
-  if (app.model.data.embeddings.length === 0)
-    return "Open Settings and add at least one embedding.";
+  if (!hasInput.value) return "Open Settings to select an input dataset and the sequence to embed.";
+  if (selectionIncomplete.value) return "Open Settings and choose a sequence and a model to embed.";
   if (resultsStale.value) return "Settings changed — press Run to update the results.";
   return "Press Run to compute embeddings.";
 });

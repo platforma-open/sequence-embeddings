@@ -17,30 +17,10 @@
  */
 import type { EmbeddingModelId, ModelTag, ScopeFeature, WorkflowReceptor } from "./types";
 
-/**
- * How a model consumes the scope's sequence. Drives the Python step's per-model
- * input preparation:
- *  - `aa`               — the AA sequence column as-is (most models).
- *  - `aa-cdr3-trimmed`  — CDR3 AA with the conserved flanking C/W stripped (H3BERTa).
- *  - `aa-spaced`        — residues space-separated, e.g. "C A S S" (TCR-BERT).
- *  - `smiles`           — AA converted to a SMILES string (PeptideCLM-2).
- *  - `paired-structured`— paired V-gene symbols + CDR1/2/3 loops (SCEPTR, pass 2).
- *
- * Mirror of the workflow's per-tag `inputKind` (compute-embeddings.tpl.tengo); the
- * two must agree. The workflow value is the one actually passed to the Python step.
- */
-export type ModelInputKind =
-  | "aa"
-  | "aa-cdr3-trimmed"
-  | "aa-spaced"
-  | "smiles"
-  | "paired-structured";
-
 export type EmbeddingModelSpec = {
   id: EmbeddingModelId;
   /** Dropdown label. */
   label: string;
-  inputKind: ModelInputKind;
   /** Receptors this model serves. Ignored for the `peptide` feature (peptide
    *  inputs carry no receptor); gated on for VDJ features. */
   receptors: readonly WorkflowReceptor[];
@@ -49,12 +29,6 @@ export type EmbeddingModelSpec = {
   /** Heavy-chain-only specialist (VHHBERT, H3BERTa): only embeds IG heavy scopes
    *  (`SelectedScope.isHeavy`). Omitted/false = any chain. */
   heavyOnly?: boolean;
-  /** Embedding dimension (fixed per model; ESM-2 varies by fidelity). */
-  dim: number | "varies";
-  /** true = shipped as a downloaded weight asset; false = pip dep in the runenv. */
-  asset: boolean;
-  /** Rollout pass (informational): 1 = AA-sequence models, 2 = SCEPTR. */
-  pass: 1 | 2;
   /** Default-selection priority among compatible models (higher wins). ESM-2 is
    *  0 so any specialist beats it; the VHH-vs-mAb tiebreak is applied in
    *  `recommendedModel`, not via priority. */
@@ -66,10 +40,10 @@ export type EmbeddingModelSpec = {
  * prep). Wired so far: ESM-2, CurrAb, VHHBERT, H3BERTa and TCR-BERT (all HF
  * checkpoints via the shared `AutoModel` loader), PeptideCLM-2 (HF custom model via
  * trust_remote_code) and AbLang2 (the `ablang2` pip model with asset-shipped
- * weights). Input prep per model: AA as-is (ESM-2/CurrAb/VHHBERT/AbLang2), CDR3
- * flank-trim (H3BERTa, `aa-cdr3-trimmed`), space-separated residues (TCR-BERT,
- * `aa-spaced`), or AA→SMILES (PeptideCLM-2, `smiles`) — all applied in the Python
- * step. Only SCEPTR (pass 2) remains: it needs paired V-gene + CDR assembly the
+ * weights). Input prep per model: AA as-is (ESM-2/CurrAb/AbLang2), CDR3
+ * flank-trim (H3BERTa, `aa-cdr3-trimmed`), space-separated residues (TCR-BERT and
+ * VHHBERT, `aa-spaced` — their tokenizers need one token per residue), or AA→SMILES
+ * (PeptideCLM-2, `smiles`) — all applied in the Python step. Only SCEPTR (pass 2) remains: it needs paired V-gene + CDR assembly the
  * block does not yet gather. Add a model's id here as its asset/runenv/routing
  * lands — the UI and matrix pick it up automatically.
  */
@@ -87,91 +61,59 @@ export const EMBEDDING_MODELS: Record<EmbeddingModelId, EmbeddingModelSpec> = {
   esm2: {
     id: "esm2",
     label: "ESM-2 (universal)",
-    inputKind: "aa",
     receptors: ["IG", "TCRAB", "TCRGD"],
     features: ["peptide", "CDR3", "VDJRegion", "Fv", "scFv"],
-    dim: "varies", // 640 (150M) / 1280 (650M) by fidelity
-    asset: true,
-    pass: 1,
     priority: 0, // universal fallback — always beaten by a compatible specialist
   },
   currab: {
     id: "currab",
     label: "CurrAb (antibody)",
-    inputKind: "aa",
     receptors: ["IG"],
     features: ["VDJRegion", "Fv"],
-    dim: 1280,
-    asset: true,
-    pass: 1,
     priority: 50,
   },
   ablang2: {
     id: "ablang2",
     label: "AbLang2 (antibody)",
-    inputKind: "aa",
     receptors: ["IG"],
     features: ["VDJRegion", "Fv"],
-    dim: 480,
-    asset: false, // pip dep (custom ablang2 package)
-    pass: 1,
     priority: 40,
   },
   vhhbert: {
     id: "vhhbert",
     label: "VHHBERT (nanobody)",
-    inputKind: "aa",
     receptors: ["IG"],
     features: ["VDJRegion"],
     heavyOnly: true,
-    dim: 768,
-    asset: true,
-    pass: 1,
     priority: 45,
   },
   h3berta: {
     id: "h3berta",
     label: "H3BERTa (CDR-H3)",
-    inputKind: "aa-cdr3-trimmed",
     receptors: ["IG"],
     features: ["CDR3"],
     heavyOnly: true,
-    dim: 768,
-    asset: true,
-    pass: 1,
     priority: 50,
   },
   "tcr-bert": {
     id: "tcr-bert",
     label: "TCR-BERT (CDR3)",
-    inputKind: "aa-spaced",
     receptors: ["TCRAB"],
     features: ["CDR3"],
-    dim: 768,
-    asset: true,
-    pass: 1,
     priority: 50,
   },
   peptideclm2: {
     id: "peptideclm2",
     label: "PeptideCLM-2 (peptide)",
-    inputKind: "smiles",
     receptors: ["IG", "TCRAB", "TCRGD"], // ignored — peptide feature carries no receptor
     features: ["peptide"],
-    dim: 1024,
-    asset: true,
-    pass: 1,
     priority: 50, // peptide default, per product decision (re-evaluate after testing)
   },
   sceptr: {
     id: "sceptr",
     label: "SCEPTR (paired αβ)",
-    inputKind: "paired-structured",
     receptors: ["TCRAB"],
     features: ["VDJRegion", "Fv"],
-    dim: 64,
-    asset: false, // pip dep (libtcrlm + tidytcells)
-    pass: 2, // gated off until the paired V-gene+CDR assembly path lands
     priority: 60,
   },
 };
@@ -237,17 +179,6 @@ export function compatibleModels(
   return (Object.keys(EMBEDDING_MODELS) as EmbeddingModelId[])
     .filter((id) => modelSupports(EMBEDDING_MODELS[id], feature, isHeavy, receptor))
     .sort((a, b) => EMBEDDING_MODELS[b].priority - EMBEDDING_MODELS[a].priority);
-}
-
-/** Scopes (from the available set) this model can embed — for model-first
- *  filtering of the sequence dropdown. */
-export function compatibleScopes<T extends { feature: ScopeFeature; isHeavy: boolean }>(
-  model: EmbeddingModelId,
-  scopes: T[],
-  receptor: WorkflowReceptor,
-): T[] {
-  const spec = EMBEDDING_MODELS[model];
-  return scopes.filter((s) => modelSupports(spec, s.feature, s.isHeavy, receptor));
 }
 
 /** True if a (scope, model) pair is valid — used by the args validator. */
