@@ -159,8 +159,10 @@ export type WorkflowScopeStats = {
   n_entities?: number;
   /** Clones dropped before inference (empty or partial sequence for this scope). */
   n_dropped_empty?: number;
-  /** Sequences truncated from the C-terminus for exceeding the token limit. */
-  n_truncated?: number;
+  /** Sequences truncated from the C-terminus for exceeding the token limit. `null` = N/A:
+   *  SMILES models (PeptideCLM-2) tokenize the AA→SMILES string, not residues, so an
+   *  AA-length truncation count is meaningless and isn't reported. */
+  n_truncated?: number | null;
 };
 
 /**
@@ -168,7 +170,10 @@ export type WorkflowScopeStats = {
  * computed" summary on the block UI and to surface device routing decisions.
  */
 export type WorkflowStats = {
-  device_used: "cpu" | "gpu";
+  /** Device the run actually executed on, resolved from the request (a torch device type). */
+  device_used: "cpu" | "cuda" | "mps";
+  /** Device the workflow requested, before runtime availability resolution. */
+  device_requested?: "cpu" | "gpu";
   /** The single model loaded for the run (chosen by device tier). */
   model: ModelTag;
   /**

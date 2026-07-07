@@ -1,6 +1,6 @@
 // Sequence Embeddings — workflow root (batch-processed).
 //
-// For each embedding task (scope × model), runs the embedding step via
+// For the selected embedding task (scope × model), runs the embedding step via
 // `pframes.processColumn` in BATCH mode: the orchestrator splits the scope's
 // keyspace into batches of `batch.size` (capped by `batch.maxBatches`), renders
 // the `compute-embeddings` body per batch, and merges each batch's long-format
@@ -63,13 +63,10 @@ wf.prepare(func(args) {
 	bb.ignoreMissingDomains()
 	bb.addAnchor("main", args.inputAnchor)
 
-	// Pull in each embedding task's sequence column(s) by their universal id.
-	// Fv carries two ids ([VH, VL]); single-chain scopes carry one. Tasks may
-	// share a scope (same sequence, different model) — addSingle dedups.
-	for task in args.embeddings {
-		for colId in task.scope.columns {
-			bb.addSingle(colId)
-		}
+	// Single selection: exactly one (scope, model) task (the UI emits a 1-element list). Pull its
+	// sequence column(s): Fv carries two ids ([VH, VL]), single-chain scopes one.
+	for colId in args.embeddings[0].scope.columns {
+		bb.addSingle(colId)
 	}
 
 	return { columns: bb.build() }
@@ -91,7 +88,7 @@ wf.body(func(args) {
 
 	// First axis matching a recognized entity-key name — the batch key.
 	keyAxisSpec := undefined
-	for _, axisSpec in axes {
+	for axisSpec in axes {
 		if isKeyAxis(axisSpec) {
 			keyAxisSpec = axisSpec
 			break
@@ -136,146 +133,129 @@ wf.body(func(args) {
 	}
 
 	pf := pframes.pFrameBuilder()
-	// Collected for the run-report counting pass (compute-stats). Columns ride in
-	// a MAP keyed by a global seqN header — render rejects arrays that contain
-	// references, so the column refs can't be nested in the per-scope array.
+	// Collected for the run-report counting pass (compute-stats). Columns ride in a
+	// MAP keyed by a seqN header — render rejects arrays that contain references, so
+	// the column refs can't be nested in the scope array.
 	statsCols := {}      // seqN header -> source column {spec,data}
-	statsScopes := []    // [{ name, feature, chain, label, model, sourceColumns: [seqN] }] — ref-free
-	statsSeqIdx := 0
-	statsHeaderBySpec := {} // canonical(spec) -> seqN header — dedups columns shared across scopes
+	statsScopes := []    // one entry (single task): { name, feature, chain, label, model, sourceColumns: [seqN] }
 
-	for task in args.embeddings {
-		scope := task.scope
-		modelTag := models.resolveModelTag(task)
-		taskModel := models.get(modelTag)   // registry entry (maxLength etc.)
+	task := args.embeddings[0]
+	scope := task.scope
+	modelTag := models.resolveModelTag(task)
+	taskModel := models.get(modelTag)   // registry entry (maxLength etc.)
 
-		// Clean filename-safe scope name (feature[_chain]); the task name appends
-		// the model tag so the same scope embedded by two models/fidelities yields
-		// distinct columns. The model also rides the value column's domain.
-		scopeName := scope.feature
-		if scope.chain != "" {
-			scopeName = scope.feature + "_" + scope.chain
-		}
-		taskName := scopeName + "__" + modelTag
+	// Clean filename-safe scope name (feature[_chain]); the task name appends
+	// the model tag so the same scope embedded by two models/fidelities yields
+	// distinct columns. The model also rides the value column's domain.
+	scopeName := scope.feature
+	if scope.chain != "" {
+		scopeName = scope.feature + "_" + scope.chain
+	}
+	taskName := scopeName + "__" + modelTag
 
-		// Source columns → primary (first) + secondary (rest). Headers seqN match
-		// the plan's sourceColumns the Python step reads.
-		primaryCol := bundle.getColumn(scope.columns[0])
-		primaryEntry := { src: { spec: primaryCol.spec, data: primaryCol.data }, header: "seq0" }
-		srcHeaders := ["seq0"]
-		scopeCols := [primaryCol]
-		secondaryEntries := []
-		for i := 1; i < len(scope.columns); i++ {
-			h := "seq" + string(i)
-			c := bundle.getColumn(scope.columns[i])
-			secondaryEntries = append(secondaryEntries, { src: { spec: c.spec, data: c.data }, header: h })
-			srcHeaders = append(srcHeaders, h)
-			scopeCols = append(scopeCols, c)
-		}
+	// Source columns → primary (first) + secondary (rest). Headers seqN match
+	// the plan's sourceColumns the Python step reads.
+	primaryCol := bundle.getColumn(scope.columns[0])
+	primaryEntry := { src: { spec: primaryCol.spec, data: primaryCol.data }, header: "seq0" }
+	srcHeaders := ["seq0"]
+	scopeCols := [primaryCol]
+	secondaryEntries := []
+	for i := 1; i < len(scope.columns); i++ {
+		h := "seq" + string(i)
+		c := bundle.getColumn(scope.columns[i])
+		secondaryEntries = append(secondaryEntries, { src: { spec: c.spec, data: c.data }, header: h })
+		srcHeaders = append(srcHeaders, h)
+		scopeCols = append(scopeCols, c)
+	}
 
-		// Augmented scope for the output column specs (unique id via taskName; the
-		// user-facing label stays the clean scope label).
-		s := {
-			name: taskName,
-			feature: scope.feature,
-			chain: scope.chain,
-			label: scope.label,
-			model: modelTag
-		}
+	// Augmented scope for the output column specs (unique id via taskName; the
+	// user-facing label stays the clean scope label).
+	s := {
+		name: taskName,
+		feature: scope.feature,
+		chain: scope.chain,
+		label: scope.label,
+		model: modelTag
+	}
 
-		// Single-task plan for the Python step. Canonical encoding keeps the
-		// per-batch body content-ID deterministic (dedup).
-		scopePlan := {
-			device: device,
-			scopes: [{
-				name: taskName,
-				feature: scope.feature,
-				chain: scope.chain,
-				label: scope.label,
-				model: modelTag,
-				// IG heavy-chain flag (single-cell chain A, or bulk IGHeavy). The
-				// Python step uses it to pick AbLang2's heavy/light slot for a
-				// single-chain scope (bulk light = chain "" + isHeavy false, so chain
-				// alone is insufficient).
-				isHeavy: scope.isHeavy,
-				sourceColumns: srcHeaders
-			}]
-		}
-		planJson := string(canonical.encode(scopePlan))
-
-		// Sequences-per-clonotype = column count (Fv = 2). Keep each batch's
-		// sequence volume ~constant by dividing the clonotype batch size.
-		batchSize := minBatch / len(scope.columns)
-
-		proc := pframes.processColumn(
-			{ primary: primaryEntry, columns: secondaryEntries, primaryJoin: "full" },
-			computeEmbeddingsTpl,
-			[{
-				type: "Xsv",
-				name: "embedding",
-				xsvType: "parquet",
-				settings: columnSpecs.buildEmbeddingOutputSettings(s, keyAxisName)
-			}],
-			{
-				batch: {
-					size: batchSize,
-					keyColumns: [keyAxisName],
-					format: "tsv",
-					passContent: false,
-					maxBatches: MAX_BATCHES
-				},
-				extra: {
-					planJson: smart.createJsonResource(planJson),
-					scopeName: smart.createJsonResource(taskName),
-					modelTag: smart.createJsonResource(modelTag),
-					keyCol: smart.createJsonResource(keyAxisName),
-					device: smart.createJsonResource(device)
-				},
-				metaExtra: {
-					cpu: smart.createJsonResource(embedCpu),
-					mem: smart.createJsonResource(embedMemGiB)
-				}
-			}
-		)
-
-		// Merge this task's embedding column into the export pframe, stamped with
-		// blockId + the model-specific provenance trace.
-		stamp := makeStamp(modelTag)
-		for colName in proc.listXsvColumns("embedding") {
-			o := proc.output("embedding", colName)
-			pf.add(taskName, stamp(o.spec), o.data)
-		}
-
-		// Run-report rows are per TASK (scope × model): the same scope embedded by
-		// two models yields two report rows, each carrying its own model so the UI
-		// can show one row per (sequence, model). Use taskName as the row identity.
-		// Sequence counts (n_entities/n_dropped) are model-independent; the same
-		// scope re-counted under another model is a cheap vectorised pass over the
-		// same columns. Assign each of the scope's columns a global seqN header
-		// (refs ride in a map), deduplicating by column spec across rows so a column
-		// shared by Fv and a standalone chain is materialised once.
-		statsHeaders := []
-		for col in scopeCols {
-			specKey := string(canonical.encode(col.spec))
-			h := statsHeaderBySpec[specKey]
-			if is_undefined(h) {
-				h = "seq" + string(statsSeqIdx)
-				statsCols[h] = col
-				statsHeaderBySpec[specKey] = h
-				statsSeqIdx = statsSeqIdx + 1
-			}
-			statsHeaders = append(statsHeaders, h)
-		}
-		statsScopes = append(statsScopes, {
+	// Single-task plan for the Python step. Canonical encoding keeps the
+	// per-batch body content-ID deterministic (dedup).
+	scopePlan := {
+		device: device,
+		scopes: [{
 			name: taskName,
 			feature: scope.feature,
 			chain: scope.chain,
 			label: scope.label,
 			model: modelTag,
-			maxLength: taskModel.maxLength,   // per-model truncation cap for the count
-			sourceColumns: statsHeaders
-		})
+			// IG heavy-chain flag (single-cell chain A, or bulk IGHeavy). The
+			// Python step uses it to pick AbLang2's heavy/light slot for a
+			// single-chain scope (bulk light = chain "" + isHeavy false, so chain
+			// alone is insufficient).
+			isHeavy: scope.isHeavy,
+			sourceColumns: srcHeaders
+		}]
 	}
+	planJson := string(canonical.encode(scopePlan))
+
+	// Sequences-per-clonotype = column count (Fv = 2). Keep each batch's
+	// sequence volume ~constant by dividing the clonotype batch size.
+	batchSize := minBatch / len(scope.columns)
+
+	proc := pframes.processColumn(
+		{ primary: primaryEntry, columns: secondaryEntries, primaryJoin: "full" },
+		computeEmbeddingsTpl,
+		[{
+			type: "Xsv",
+			name: "embedding",
+			xsvType: "parquet",
+			settings: columnSpecs.buildEmbeddingOutputSettings(s, keyAxisName)
+		}],
+		{
+			batch: {
+				size: batchSize,
+				keyColumns: [keyAxisName],
+				format: "tsv",
+				passContent: false,
+				maxBatches: MAX_BATCHES
+			},
+			extra: {
+				planJson: smart.createJsonResource(planJson),
+				scopeName: smart.createJsonResource(taskName),
+				modelTag: smart.createJsonResource(modelTag),
+				keyCol: smart.createJsonResource(keyAxisName),
+				device: smart.createJsonResource(device)
+			},
+			metaExtra: {
+				cpu: smart.createJsonResource(embedCpu),
+				mem: smart.createJsonResource(embedMemGiB)
+			}
+		}
+	)
+
+	// Merge this task's embedding column into the export pframe, stamped with
+	// blockId + the model-specific provenance trace.
+	stamp := makeStamp(modelTag)
+	for colName in proc.listXsvColumns("embedding") {
+		o := proc.output("embedding", colName)
+		pf.add(taskName, stamp(o.spec), o.data)
+	}
+
+	// Run report — one row for the single task. Each source column keeps its plan header seqN
+	// (the map keeps refs out of the array, which render rejects); srcHeaders (built above) are
+	// exactly those keys, so reuse them as the scope's sourceColumns.
+	for i, col in scopeCols {
+		statsCols["seq" + string(i)] = col
+	}
+	statsScopes = append(statsScopes, {
+		name: taskName,
+		feature: scope.feature,
+		chain: scope.chain,
+		label: scope.label,
+		model: modelTag,
+		maxLength: taskModel.maxLength,   // per-model truncation cap for the count
+		sourceColumns: srcHeaders
+	})
 
 	finalPf := pf.build()
 
@@ -284,16 +264,20 @@ wf.body(func(args) {
 	// the scopes' columns collected above and runs `main.py --stats-only` (no
 	// model, no embedding) to count per-scope n_entities / n_dropped / n_truncated.
 	// -----------------------------------------------------------------------
-	// The counting pass is model-independent (it tallies sequences/truncation);
-	// pass a representative tag (the first task's) for max_length + the report.
-	reportModelTag := models.resolveModelTag(args.embeddings[0])
+	// Run-report counting pass. Reuses the task's model tag (report max_length) and is handed the
+	// model's inputKind + pairMode so it applies the SAME sequence transform and joint/concat
+	// pairing as the embed pass; otherwise smiles/cdr3-trim drops and joint combined-length
+	// truncation would be miscounted (single model per run, one value each).
+	reportModelTag := modelTag
 	statsRender := render.create(computeStatsTpl, {
 		cols: statsCols,
 		scopes: statsScopes,
 		keyAxisSpec: keyAxisSpec,
 		keyCol: keyAxisName,
 		device: device,
-		modelTag: reportModelTag
+		modelTag: reportModelTag,
+		inputKind: taskModel.inputKind,
+		pairMode: taskModel.pairMode
 	}, {
 		metaInputs: { cpu: 1, mem: 4 }
 	})

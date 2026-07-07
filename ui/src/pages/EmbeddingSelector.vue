@@ -19,7 +19,8 @@ import { computed } from "vue";
 const selection = defineModel<EmbeddingSelection>({ required: true });
 // `config` is OPTIONAL: the dropdowns render always (even before an input is
 // connected or while scopes resolve), just with empty options until it arrives.
-const props = defineProps<{ config?: ScopeConfig }>();
+// `disabled` greys them out until the caller signals this input's defaults have loaded.
+const props = defineProps<{ config?: ScopeConfig; disabled?: boolean }>();
 
 // Every available scope for the connected input (empty until `config` resolves).
 const scopeOptions = computed(() => props.config?.options ?? []);
@@ -83,6 +84,7 @@ function onFidelity(fidelity: Fidelity) {
   <PlDropdown
     :model-value="selection.scope?.id"
     :options="sequenceOptions"
+    :disabled="disabled"
     label="Sequence to embed"
     required
     @update:model-value="onSequence"
@@ -95,6 +97,7 @@ function onFidelity(fidelity: Fidelity) {
   <PlDropdown
     :model-value="selection.model"
     :options="modelOptions"
+    :disabled="disabled"
     label="Model"
     required
     @update:model-value="onModel"

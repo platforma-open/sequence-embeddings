@@ -97,11 +97,6 @@ export const platforma = BlockModelV3.create(blockDataModel)
   // Dropdown source for the input picker. Refs returned here populate the UI
   // selector; the user's pick is written back into `data.inputAnchor`.
   .output("inputOptions", (ctx) => ctx.resultPool.getOptions(inputAnchorSpecs))
-  // Spec for the currently selected ref. UI uses this to display the dataset
-  // shape (axis names, domain) and to gate subtitle / status text.
-  .output("inputSpec", (ctx) =>
-    ctx.data.inputAnchor ? ctx.resultPool.getPColumnSpecByRef(ctx.data.inputAnchor) : undefined,
-  )
   // Scope picker config — derived from the connected input's sequence columns.
   // `options` feeds the sequence dropdown; `defaults` (+ receptor/paired) seed the
   // selection on first connection. The UI snapshots a chosen scope (column id(s),

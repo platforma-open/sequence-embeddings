@@ -32,7 +32,8 @@ type StatsRow = {
   total: number | undefined;
   embedded: number | undefined;
   dropped: number | undefined;
-  trimmed: number | undefined;
+  // number = count; null = N/A (SMILES models don't track residue truncation); undefined = not yet reported.
+  trimmed: number | null | undefined;
   // This row's model residue limit (its token cap minus the 2 specials). Per-model —
   // the run can span models with different limits — so the threshold is per row, not
   // a single column header. Undefined if the report didn't carry it.
@@ -56,7 +57,10 @@ const rowData = computed<StatsRow[]>(() =>
       embedded,
       dropped,
       trimmed: s.n_truncated,
-      maxResidues: typeof s.max_length === "number" ? s.max_length - 2 : undefined,
+      // SMILES models report n_truncated = null (N/A) — they tokenize the AA→SMILES string,
+      // not residues, so a residue "Input Limit" is meaningless → show "—" for those rows too.
+      maxResidues:
+        s.n_truncated !== null && typeof s.max_length === "number" ? s.max_length - 2 : undefined,
     };
   }),
 );
@@ -165,7 +169,7 @@ const columnDefs = computed<ColDef<StatsRow>[]>(() => {
       headerComponentParams: {
         type: "Number",
         tooltip:
-          "This model's maximum input length in amino acids; longer sequences are truncated before embedding. Differs per model.",
+          "This model's maximum input length in amino acids; longer sequences are truncated before embedding. Differs per model, and shows “—” for models that don't tokenize residues (e.g. PeptideCLM-2, which embeds an AA→SMILES string).",
       } satisfies PlAgHeaderComponentParams,
       flex: 1,
       minWidth: 120,

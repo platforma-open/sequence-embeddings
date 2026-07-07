@@ -47,6 +47,13 @@ function setInput(ref?: PlRef) {
 
 const config = computed<ScopeConfig | undefined>(() => app.model.outputs.availableScopes);
 
+// The Sequence/Model dropdowns stay disabled until THIS input's scope config (which
+// carries the recommended defaults) has resolved.
+const defaultsLoaded = computed(() => {
+  const anchor = app.model.data.inputAnchor;
+  return anchor !== undefined && config.value?.forAnchor === JSON.stringify(anchor);
+});
+
 // GPU-heavy models (CurrAb, ESM-2 650M via High fidelity) run slowly on a CPU-only
 // backend. gpuAvailable comes from the prerun; undefined while it resolves, so
 // only warn on an explicit `false`.
@@ -95,7 +102,11 @@ const slowOnCpu = computed(() => {
     </PlDropdownRef>
 
     <!-- Sequence and Model dropdowns -->
-    <EmbeddingSelector v-model="app.model.data.embedding" :config="config" />
+    <EmbeddingSelector
+      v-model="app.model.data.embedding"
+      :config="config"
+      :disabled="!defaultsLoaded"
+    />
 
     <PlAlert v-if="slowOnCpu" type="warn">
       <strong>The selected model runs best on a GPU — this machine has none.</strong>
