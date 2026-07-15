@@ -88,6 +88,29 @@ label := func(tag) {
 	return m.label
 }
 
+// GPU VRAM to request for a tag, in GiB. This is a SCHEDULING request — it selects
+// the GPU node tier (backend maps it to the `platforma.bio/gpu-memory-gib` node
+// selector) and rides to the runner as PLATFORMA_GPU_MEMORY, which sizes the GPU
+// token budget (see software main.py resolve_gpu_token_budget). It is NOT a hard
+// cap: the forward pass is token-budgeted with a halve-on-OOM retry.
+//
+// Kept as small as safely fits so the job lands on the CHEAP fractional-L4 g6f
+// tiers, never the big 4×L40S g6e.12xlarge (gpu-96g). Two tiers by model width:
+//   - dim <= 768 (BERT-base-scale: H3BERTa/VHHBERT/TCR-BERT, AbLang2, ESM-2 150M)
+//     -> 3 GiB -> gpu-3g (g6f.xlarge). Footprint ~1.5 GiB (CUDA context + <=0.3 GiB
+//     fp16 weights + a few 100 MB activations), so 3 GiB has margin even at the
+//     default token budget.
+//   - dim >= 1024 (ESM-2 650M, CurrAb, fp32 PeptideCLM-2) -> 6 GiB -> gpu-6g
+//     (g6f.2xlarge). Peak ~3.7 GiB for ESM-2 650M at the default budget; 6 GiB
+//     leaves headroom and the adaptive budget shrinks batches when VRAM is tighter.
+gpuVramGiB := func(tag) {
+	m := MODELS[tag]
+	if is_undefined(m) {
+		return 6   // unknown tag: the safer of the two small tiers
+	}
+	return m.dim >= 1024 ? 6 : 3
+}
+
 // Final output vector length for a (scope, model): the base width D, doubled for a
 // paired Fv scope embedded by a non-joint (concat) model — VH⊕VL → 2D. Single
 // chains, scFv, and joint-Fv (CurrAb/AbLang2) stay at D. undefined for an unmapped
@@ -108,5 +131,6 @@ export ll.toStrict({
 	resolveModelTag: resolveModelTag,
 	get: get,
 	label: label,
+	gpuVramGiB: gpuVramGiB,
 	outputVectorLength: outputVectorLength
 })

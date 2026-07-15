@@ -109,9 +109,17 @@ wf.body(func(args) {
 		minBatch = MIN_BATCH_GPU
 	}
 
-	// Advanced resource overrides for the embedding execs.
-	embedCpu := is_undefined(args.cpu) ? 16 : args.cpu
-	embedMemGiB := is_undefined(args.mem) ? 32 : args.mem
+	// Advanced resource overrides for the embedding execs. Passed through RAW
+	// (possibly unset) as metaExtra below: compute-embeddings uses a static override
+	// where present and its data-driven resource formula where absent. metaExtra is
+	// scheduling-only (CID-transparent), so conditionally including a key is dedup-safe.
+	embedMeta := {}
+	if !is_undefined(args.cpu) {
+		embedMeta.cpu = smart.createJsonResource(args.cpu)
+	}
+	if !is_undefined(args.mem) {
+		embedMeta.mem = smart.createJsonResource(args.mem)
+	}
 
 	// Provenance trace seeded from the input dataset. The trace label and id carry
 	// the MODEL, so two columns embedding the same scope with different models get
@@ -226,10 +234,7 @@ wf.body(func(args) {
 				keyCol: smart.createJsonResource(keyAxisName),
 				device: smart.createJsonResource(device)
 			},
-			metaExtra: {
-				cpu: smart.createJsonResource(embedCpu),
-				mem: smart.createJsonResource(embedMemGiB)
-			}
+			metaExtra: embedMeta
 		}
 	)
 

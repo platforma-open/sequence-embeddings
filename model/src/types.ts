@@ -206,8 +206,8 @@ export type BlockDataV1 = {
   scopesInitializedForAnchor?: string;
   /**
    * Advanced — host resources for the embedding step (Resource Allocation in
-   * Advanced Settings). `mem` is GiB, `cpu` is cores. Undefined → workflow
-   * defaults (32 GiB / 16 cores).
+   * Advanced Settings). `mem` is GiB, `cpu` is cores. Undefined → workflow sizes
+   * automatically from device (CPU/GPU) and input volume.
    */
   mem?: number;
   cpu?: number;
@@ -227,7 +227,7 @@ export type BlockDataV2 = {
    * Init-guard: canonical id of the anchor whose default cards were last seeded.
    */
   embeddingsInitializedForAnchor?: string;
-  /** Advanced resource overrides (GiB / cores); undefined → workflow defaults. */
+  /** Advanced resource overrides (GiB / cores); undefined → workflow sizes automatically from device + input. */
   mem?: number;
   cpu?: number;
   defaultBlockLabel?: string;
@@ -249,7 +249,7 @@ export type BlockDataV3 = {
    * input change.
    */
   embeddingInitializedForAnchor?: string;
-  /** Advanced resource overrides (GiB / cores); undefined → workflow defaults. */
+  /** Advanced resource overrides (GiB / cores); undefined → workflow sizes automatically from device + input. */
   mem?: number;
   cpu?: number;
   defaultBlockLabel?: string;
@@ -279,7 +279,7 @@ export type BlockArgs = {
   inputAnchor: PlRef;
   /** Tasks to emit — a 1-element list projected from `data.embedding` (validated complete + compatible). */
   embeddings: EmbeddingTask[];
-  /** Advanced resource overrides for the embedding step (GiB / cores); undefined → workflow defaults. */
+  /** Advanced resource overrides for the embedding step (GiB / cores); undefined → workflow sizes automatically. */
   mem?: number;
   cpu?: number;
 };

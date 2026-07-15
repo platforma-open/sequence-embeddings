@@ -64,6 +64,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -86,6 +87,17 @@ DEFAULT_MAX_LENGTH = 1024
 # different sequence lengths: short peptides pack into large batches, long
 # chains into small ones.
 DEFAULT_TOKEN_BUDGET = 16384
+
+# GPU token-budget auto-sizing (see resolve_gpu_token_budget). On CUDA the token
+# budget is what bounds VRAM per forward pass, so we scale it from the VRAM the
+# workflow allocated (PLATFORMA_GPU_MEMORY) — mirroring how --max-memory-gb sizes
+# the host-RAM path. Tokens-per-GB is deliberately conservative (~2× headroom vs
+# the measured hidden-state cost of the widest wired model); the halve-on-OOM
+# retry in Embedder._forward is the backstop if a forward still overshoots.
+GPU_TOKENS_PER_GB = 4096
+GPU_RESERVE_GB = 1.0          # fragmentation + attention/temporary buffers headroom
+MIN_TOKEN_BUDGET = 4096       # floor: keep batches large enough to amortise kernel launches
+MAX_TOKEN_BUDGET = 131072     # ceiling: past this, padding waste and scheduling dominate
 
 # Single process by default; the GPU tier always runs single-process regardless.
 # Opt into CPU fan-out with --workers N (or 0 to auto-size from the CPU budget).
@@ -205,6 +217,57 @@ def estimate_model_gb(model_path: str) -> float:
                 pass
     gb = total / 1e9
     return gb if gb > 0 else 1.0   # fall back to ~1 GB if nothing is found
+
+
+def parse_gpu_memory_env() -> float:
+    """VRAM the workflow allocated to this exec, in GB, from PLATFORMA_GPU_MEMORY.
+
+    The backend emits that env in one of two shapes: a plain byte count (local
+    exec) or a k8s/SI quantity like ``16Gi`` / ``8G`` (the Kueue job template).
+    Returns 0.0 when the env is unset or unparseable — the caller then falls back
+    to the static token-budget default."""
+    raw = os.environ.get("PLATFORMA_GPU_MEMORY", "").strip()
+    if not raw:
+        return 0.0
+    if raw.isdigit():                       # local exec: raw bytes
+        return int(raw) / 1e9
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([KMGTP]i?)?B?", raw)   # k8s / SI quantity
+    if not m:
+        log_message(f"could not parse PLATFORMA_GPU_MEMORY={raw!r}; using default token budget",
+                    "WARNING")
+        return 0.0
+    value = float(m.group(1))
+    suffix = m.group(2) or ""
+    binary = {"Ki": 2 ** 10, "Mi": 2 ** 20, "Gi": 2 ** 30, "Ti": 2 ** 40, "Pi": 2 ** 50}
+    decimal = {"K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12, "P": 1e15}
+    mult = binary.get(suffix, decimal.get(suffix, 1.0))
+    return value * mult / 1e9
+
+
+def resolve_gpu_token_budget(args, device, model_path: str, model_family: str) -> int:
+    """Tokens per forward pass, sized from the allocated VRAM on the GPU path.
+
+    On CUDA the token budget is the lever that bounds VRAM, so we size it from the
+    VRAM the workflow requested (PLATFORMA_GPU_MEMORY): a larger request → larger
+    batches → higher throughput; a smaller request stays safe. This is the GPU
+    analogue of ``--max-memory-gb`` for host RAM. An explicit --token-budget wins;
+    off the CUDA path, or with no VRAM signal, we keep the static default. The
+    halve-on-OOM retry in Embedder._forward remains the backstop if a forward
+    still overshoots the estimate."""
+    if args.token_budget and args.token_budget > 0 and args.token_budget != DEFAULT_TOKEN_BUDGET:
+        return args.token_budget            # explicit operator override
+    if device.type != "cuda":               # budget only bounds VRAM; CPU/MPS keep the default
+        return args.token_budget
+    gpu_gb = parse_gpu_memory_env()
+    if gpu_gb <= 0:
+        return args.token_budget
+    # Standard HF encoders load fp16 on CUDA; custom (trust_remote_code) models stay
+    # fp32 — mirror Embedder.dtype so the weights term matches the resident copy.
+    fp16 = model_family != "hf-custom"
+    weights_gb = estimate_model_gb(model_path) * (0.5 if fp16 else 1.0)
+    avail_gb = max(0.5, gpu_gb - weights_gb - GPU_RESERVE_GB)
+    budget = int(avail_gb * GPU_TOKENS_PER_GB)
+    return max(MIN_TOKEN_BUDGET, min(budget, MAX_TOKEN_BUDGET))
 
 
 def resolve_parallelism(args, device, model_path: str) -> "tuple[int, int]":
@@ -1208,7 +1271,8 @@ def main() -> int:
     parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH,
                         help="Max residue tokens incl. specials; longer sequences truncate from the C-terminus")
     parser.add_argument("--token-budget", type=int, default=DEFAULT_TOKEN_BUDGET,
-                        help="Max tokens (batch × padded length) per forward pass")
+                        help="Max tokens (batch × padded length) per forward pass. On CUDA, "
+                             "auto-sized from allocated VRAM (PLATFORMA_GPU_MEMORY) unless set here.")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                         help="CPU inference processes. 1 = single process (default); "
                              "0 = auto (size from --cpus: ~2 threads/worker, total ≈ cpus, "
@@ -1247,6 +1311,12 @@ def main() -> int:
 
     device = resolve_device(plan.device)
 
+    # Tokens per forward pass. On CUDA this is sized from the allocated VRAM
+    # (PLATFORMA_GPU_MEMORY) so the workflow's VRAM request drives the GPU batch
+    # size; elsewhere it is the static default. Computed once and shared by every
+    # embedder below (they all take it as `token_budget`).
+    token_budget = resolve_gpu_token_budget(args, device, args.model_path, args.model_family)
+
     # Decide CPU parallelism (workers × intra-op threads). Auto sizing and the
     # GPU/MPS single-process guard live in resolve_parallelism.
     workers, threads_per_worker = resolve_parallelism(args, device, args.model_path)
@@ -1254,27 +1324,27 @@ def main() -> int:
     trust_remote_code = args.model_family == "hf-custom"
     if args.model_family == "ablang2":
         # The pip model runs single-process regardless of --workers (see class doc).
-        embedder = AbLang2Embedder(args.model_path, device, args.max_length, args.token_budget,
+        embedder = AbLang2Embedder(args.model_path, device, args.max_length, token_budget,
                                    input_kind=args.input_kind)
         workers, threads_per_worker = 1, 0
         parallel_note = "ablang2 (single process)"
     elif trust_remote_code:
         # Custom trust_remote_code model (PeptideCLM-2): single process — spawn + the
         # dynamic module import is fragile. Load once in-process; let torch use all cores.
-        embedder = Embedder(args.model_path, device, args.max_length, args.token_budget,
+        embedder = Embedder(args.model_path, device, args.max_length, token_budget,
                             threads=0, input_kind=args.input_kind, trust_remote_code=True,
                             emb_layer=args.emb_layer, pool_special_tokens=args.pool_special_tokens)
         workers, threads_per_worker = 1, 0
         parallel_note = "hf-custom (single process)"
     elif workers > 1:
-        embedder = ParallelEmbedder(args.model_path, device, args.max_length, args.token_budget,
+        embedder = ParallelEmbedder(args.model_path, device, args.max_length, token_budget,
                                     workers, threads_per_worker, input_kind=args.input_kind,
                                     trust_remote_code=trust_remote_code,
                                     emb_layer=args.emb_layer,
                                     pool_special_tokens=args.pool_special_tokens)
         parallel_note = f"workers={workers}×{threads_per_worker} threads/worker"
     else:
-        embedder = Embedder(args.model_path, device, args.max_length, args.token_budget,
+        embedder = Embedder(args.model_path, device, args.max_length, token_budget,
                             threads=threads_per_worker, input_kind=args.input_kind,
                             trust_remote_code=trust_remote_code,
                             emb_layer=args.emb_layer, pool_special_tokens=args.pool_special_tokens)
@@ -1284,7 +1354,8 @@ def main() -> int:
 
     # Record device + checkpoint at startup so the operator sees what ran.
     log_message(f"device={device.type} dtype={embedder.dtype} model={model_name} dim={embedder.dim} "
-                f"{parallel_note} (requested={plan.device}, scopes={len(plan.scopes)})",
+                f"token_budget={token_budget} {parallel_note} "
+                f"(requested={plan.device}, scopes={len(plan.scopes)})",
                 "STEP")
 
     stats: dict = {
