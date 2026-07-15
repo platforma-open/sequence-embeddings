@@ -91,13 +91,16 @@ self.body(func(inputs) {
 	f := exec.formula
 	run := exec.builder().
 		software(soft).
+		// Register the tagged input before the formula that references it (tag lookup
+		// is resolved at build time, so order is not functionally required — but this
+		// mirrors compute-embeddings and removes any ambiguity).
+		addFile("source.tsv", sourceTsv, { tag: "source" }).
 		resources({
 			onCPU: {
 				cpu: f.size("source").dividedBy(f.gib(1)).between(1, 4).staticFallback(1),
 				ram: f.size("source").times(3).plus(f.gib(2)).between(f.gib(4), f.gib(32)).staticFallback("4GiB")
 			}
 		}).
-		addFile("source.tsv", sourceTsv, { tag: "source" }).
 		writeFile("plan.json", planJson).
 		arg("--stats-only").
 		arg("--input").arg("source.tsv").
