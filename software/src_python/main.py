@@ -254,13 +254,13 @@ def resolve_gpu_token_budget(args, device, model_path: str, model_family: str) -
     off the CUDA path, or with no VRAM signal, we keep the static default. The
     halve-on-OOM retry in Embedder._forward remains the backstop if a forward
     still overshoots the estimate."""
-    if args.token_budget and args.token_budget > 0 and args.token_budget != DEFAULT_TOKEN_BUDGET:
-        return args.token_budget            # explicit operator override
+    if args.token_budget is not None and args.token_budget > 0:
+        return args.token_budget            # explicit operator override always wins
     if device.type != "cuda":               # budget only bounds VRAM; CPU/MPS keep the default
-        return args.token_budget
+        return DEFAULT_TOKEN_BUDGET
     gpu_gb = parse_gpu_memory_env()
     if gpu_gb <= 0:
-        return args.token_budget
+        return DEFAULT_TOKEN_BUDGET
     # Standard HF encoders load fp16 on CUDA; custom (trust_remote_code) models stay
     # fp32 — mirror Embedder.dtype so the weights term matches the resident copy.
     fp16 = model_family != "hf-custom"
@@ -1270,9 +1270,10 @@ def main() -> int:
                              "all non-pad tokens.")
     parser.add_argument("--max-length", type=int, default=DEFAULT_MAX_LENGTH,
                         help="Max residue tokens incl. specials; longer sequences truncate from the C-terminus")
-    parser.add_argument("--token-budget", type=int, default=DEFAULT_TOKEN_BUDGET,
+    parser.add_argument("--token-budget", type=int, default=None,
                         help="Max tokens (batch × padded length) per forward pass. On CUDA, "
-                             "auto-sized from allocated VRAM (PLATFORMA_GPU_MEMORY) unless set here.")
+                             "auto-sized from allocated VRAM (PLATFORMA_GPU_MEMORY) unless set here. "
+                             f"Unset elsewhere defaults to {DEFAULT_TOKEN_BUDGET}.")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                         help="CPU inference processes. 1 = single process (default); "
                              "0 = auto (size from --cpus: ~2 threads/worker, total ≈ cpus, "
