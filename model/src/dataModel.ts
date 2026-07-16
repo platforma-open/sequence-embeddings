@@ -53,7 +53,7 @@ export const blockDataModel = new DataModelBuilder()
     // The selection is seeded by the UI on first input connection (specialist-first);
     // starts blank so the dropdowns have an object to bind to before an input exists.
     embedding: {},
-    // Resource defaults for the embedding step (Advanced Settings).
-    mem: 32,
-    cpu: 16,
+    // mem/cpu are intentionally left UNSET: the workflow sizes the embedding step's
+    // resources automatically from device (CPU/GPU) and input volume. They become
+    // opt-in overrides — set only when the user fills them in Advanced Settings.
   }));

@@ -34,8 +34,12 @@ self.body(func(inputs) {
 	modelTag := inputs.modelTag        // checkpoint id + --model-name identity
 	keyCol := inputs.keyCol            // entity-key column header in the batch TSV
 	device := inputs.device            // "cpu" | "gpu" (gates the GPU request)
-	cpu := is_undefined(inputs.cpu) ? 16 : inputs.cpu
-	memGiB := is_undefined(inputs.mem) ? 32 : inputs.mem
+
+	// Advanced-settings resource overrides (either may be unset). When present, the
+	// static value wins over the data-driven formula for that dimension, on both the
+	// CPU and GPU paths (below). mem is given in GiB.
+	cpuOverride := inputs.cpu                                                   // number | undefined
+	ramOverride := is_undefined(inputs.mem) ? undefined : string(inputs.mem) + "GiB"
 
 	// Per-model recipe (inputKind, loader family, pairMode, embLayer, poolSpecials)
 	// comes from the central registry (models.lib) — the single source of truth,
@@ -71,10 +75,8 @@ self.body(func(inputs) {
 
 	builder := exec.builder().
 		software(soft).
-		mem(string(memGiB) + "GiB").
-		cpu(cpu).
 		addAsset(modelAsset, "model").
-		addFile("batch.tsv", batchFile).
+		addFile("batch.tsv", batchFile, { tag: "batch" }).
 		writeFile("plan.json", planJson).
 		arg("--input").arg("batch.tsv").
 		arg("--plan").arg("plan.json").
@@ -97,13 +99,45 @@ self.body(func(inputs) {
 		// @TODO: Update SDK and get mkDir("embeddings") once the fix that
 		// prevents it to create "[\"embeddings\"]" folder is released.
 
-	// GPU vs CPU tier is decided by the plan's device.
+	// GPU vs CPU tier is decided by the plan's device (itself set from exec.hasGpu in
+	// main.tpl). Each path declares its resources via `.resources()`; an advanced-
+	// settings override (cpuOverride / ramOverride) wins per dimension where set.
+	f := exec.formula
 	if device == "gpu" {
-		builder.gpuMemory("16GiB")
+		// GPU: the accelerator does the work in ONE streaming process, so the host only
+		// tokenizes and writes Parquet interleaved with the forward pass — no separable
+		// CPU-heavy phase (the heavy PColumn->batch-TSV shaping is upstream CPU execs).
+		// So keep the host footprint MINIMAL and sized to fit the cheapest fractional-L4
+		// node: cpu 2 + ram 8 GiB fit a g6f.xlarge (4 vCPU / 16 GiB), and the model-tiered
+		// vram (3 GiB small / 6 GiB large, models.gpuVramGiB) selects gpu-3g / gpu-6g —
+		// never the 4×L40S g6e.12xlarge the old 16/32/16 request forced. vram rides to the
+		// runner as PLATFORMA_GPU_MEMORY (sizes the token budget); host RAM via the
+		// --max-memory-gb {system.ram.gb} arg above. No --workers/--cpus (single process).
+		builder.resources({
+			onGPU: {
+				cpu: is_undefined(cpuOverride) ? 2 : cpuOverride,
+				ram: is_undefined(ramOverride) ? "8GiB" : ramOverride,
+				vram: string(models.gpuVramGiB(modelTag)) + "GiB"
+			}
+		})
 	} else {
 		builder.
 			arg("--workers").arg("0").
 			arg("--cpus").argExpr("{system.cpu}")
+
+		// CPU: throughput scales with cores (workers × intra-op threads), and the
+		// per-batch work ~= its token volume ~= the batch TSV byte size. Size cores
+		// from it (4..16) and RAM to 2 GiB/core (8..32 GiB) so ~cores/2 resident model
+		// copies fit — the fan-out the runner auto-sizes from --max-memory-gb. Both
+		// dimensions carry a .staticFallback equal to the old fixed 16 / 32 GiB, used
+		// on backends that cannot evaluate resource formulas.
+		cores := f.size("batch").dividedBy(f.mib(2)).between(4, 16)
+		builder.resources({
+			onCPU: {
+				cpu: is_undefined(cpuOverride) ? cores.staticFallback(16) : cpuOverride,
+				ram: is_undefined(ramOverride) ? cores.times(f.gib(2)).staticFallback("32GiB") : ramOverride
+			}
+		})
 	}
 
 	run := builder.

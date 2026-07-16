@@ -122,7 +122,10 @@ const slowOnCpu = computed(() => {
         :step="1"
         :maxValue="1012"
       >
-        <template #tooltip> Host memory for each embedding batch. Default: 32 GiB. </template>
+        <template #tooltip>
+          Host memory for each embedding batch. Leave empty to size automatically from device and
+          input; set to override.
+        </template>
       </PlNumberField>
       <PlNumberField
         v-model="app.model.data.cpu"
@@ -131,7 +134,10 @@ const slowOnCpu = computed(() => {
         :step="1"
         :maxValue="128"
       >
-        <template #tooltip> CPU cores for each embedding batch. Default: 16. </template>
+        <template #tooltip>
+          CPU cores for each embedding batch. Leave empty to size automatically from device and
+          input; set to override.
+        </template>
       </PlNumberField>
     </PlAccordionSection>
   </PlSlideModal>

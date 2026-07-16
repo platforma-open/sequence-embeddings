@@ -81,11 +81,26 @@ self.body(func(inputs) {
 	// Canonical encoding keeps the plan bytes deterministic.
 	planJson := string(canonical.encode({ device: inputs.device, scopes: planScopes }))
 
+	// The counting pass loads the whole source TSV into memory (read_csv, all columns
+	// Utf8), so its RAM tracks the source size rather than a flat budget: ~3× the TSV
+	// bytes (DataFrame + transient copies + arrow) on a 2 GiB base, floored at the old
+	// 4 GiB for small inputs and capped at 32 GiB. cpu gets a couple of cores on large
+	// files for the parse. Both fall back to the old fixed 4 GiB / 1 core on backends
+	// that cannot evaluate resource formulas. (The seqTb builder above stays light —
+	// ptabler streams with disk spill, so the metaInput 1 core / 4 GiB is enough.)
+	f := exec.formula
 	run := exec.builder().
 		software(soft).
-		cpu(cpu).
-		mem(string(memGiB) + "GiB").
-		addFile("source.tsv", sourceTsv).
+		// Register the tagged input before the formula that references it (tag lookup
+		// is resolved at build time, so order is not functionally required — but this
+		// mirrors compute-embeddings and removes any ambiguity).
+		addFile("source.tsv", sourceTsv, { tag: "source" }).
+		resources({
+			onCPU: {
+				cpu: f.size("source").dividedBy(f.gib(1)).between(1, 4).staticFallback(1),
+				ram: f.size("source").times(3).plus(f.gib(2)).between(f.gib(4), f.gib(32)).staticFallback("4GiB")
+			}
+		}).
 		writeFile("plan.json", planJson).
 		arg("--stats-only").
 		arg("--input").arg("source.tsv").
