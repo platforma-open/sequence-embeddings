@@ -1,5 +1,11 @@
 # @platforma-open/milaboratories.sequence-embeddings.workflow
 
+## 1.3.0
+
+### Minor Changes
+
+- 622bac2: workflow-tengo": 6.8.0
+
 ## 1.2.2
 
 ### Patch Changes
