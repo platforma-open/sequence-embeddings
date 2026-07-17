@@ -40,8 +40,8 @@ catalogs:
       specifier: 1.80.4
       version: 1.80.4
     '@platforma-sdk/workflow-tengo':
-      specifier: 6.7.2
-      version: 6.7.2
+      specifier: 6.8.0
+      version: 6.8.0
     ag-grid-enterprise:
       specifier: ~34.1.2
       version: 34.1.2
@@ -218,7 +218,7 @@ importers:
         version: link:../software
       '@platforma-sdk/workflow-tengo':
         specifier: 'catalog:'
-        version: 6.7.2
+        version: 6.8.0
     devDependencies:
       '@platforma-sdk/tengo-builder':
         specifier: 'catalog:'
@@ -1769,6 +1769,9 @@ packages:
 
   '@platforma-sdk/workflow-tengo@6.7.2':
     resolution: {integrity: sha512-KJ4tBigEDN+EIDy7K2u7PqxBIDrhwvnazJthApGg2N/HPZkinKmq0iMzHC9KZ0IsJVg6uxECIB2d2Acko33tOw==}
+
+  '@platforma-sdk/workflow-tengo@6.8.0':
+    resolution: {integrity: sha512-Ph8W/KvYUykU1jngK45Qw6/BTbcD3u58B3b8cj1aSijGv9rx1aS7iMG21Ere1lxXcqLrMPC1y+UlZnmK3cy9bw==}
 
   '@protobuf-ts/grpc-transport@2.11.1':
     resolution: {integrity: sha512-l6wrcFffY+tuNnuyrNCkRM8hDIsAZVLA8Mn7PKdVyYxITosYh60qW663p9kL6TWXYuDCL3oxH8ih3vLKTDyhtg==}
@@ -7167,6 +7170,14 @@ snapshots:
       - universal-cookie
 
   '@platforma-sdk/workflow-tengo@6.7.2':
+    dependencies:
+      '@milaboratories/pframes-rs-wasip2': 1.1.55
+      '@milaboratories/software-pframes-conv': 2.2.9
+      '@platforma-open/milaboratories.software-ptabler': 2.1.6
+      '@platforma-open/milaboratories.software-ptexter': 1.2.3
+      '@platforma-open/milaboratories.software-small-binaries': 2.1.1
+
+  '@platforma-sdk/workflow-tengo@6.8.0':
     dependencies:
       '@milaboratories/pframes-rs-wasip2': 1.1.55
       '@milaboratories/software-pframes-conv': 2.2.9
