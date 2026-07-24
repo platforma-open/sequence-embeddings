@@ -34,14 +34,26 @@ export type SeqEntry = { id: SUniversalPColumnId; spec: PColumnSpec; label: stri
 
 /**
  * Selectors for candidate sequence columns under the `main` anchor's key axis.
- * Peptide inputs match only the first; antibody/TCR inputs match the VDJ ones.
- * Filtered on amino-acid alphabet — embeddings read AA sequence.
+ * Peptide-family inputs match the first two (`pl7.app/sequence` with a `peptide`
+ * or `amplicon-sequence` feature — the latter is the synthetic-repertoire-profiler's
+ * whole-variant sequence); antibody/TCR inputs match the VDJ ones. A selector's
+ * domain is a single fixed map and can't OR two feature values, so the two
+ * peptide-family features need two entries. All filtered on amino-acid alphabet —
+ * embeddings read AA sequence.
  */
 export const SEQUENCE_SELECTORS: AnchoredPColumnSelector[] = [
   {
     axes: [{ anchor: "main", idx: 1 }],
     name: "pl7.app/sequence",
     domain: { "pl7.app/feature": "peptide", "pl7.app/alphabet": "aminoacid" },
+  },
+  {
+    axes: [{ anchor: "main", idx: 1 }],
+    name: "pl7.app/sequence",
+    // synthetic-repertoire-profiler tags its whole-variant AA sequence with the
+    // generic `amplicon-sequence` feature (shared with other consumers), not
+    // `peptide`; treat it as a peptide-family scope so it becomes embeddable.
+    domain: { "pl7.app/feature": "amplicon-sequence", "pl7.app/alphabet": "aminoacid" },
   },
   {
     axes: [{ anchor: "main", idx: 1 }],
@@ -123,7 +135,13 @@ export function buildScopeConfig(
     const d = e.spec.domain ?? {};
     const assembling = isAssembling(e.spec);
 
-    if (name === "pl7.app/sequence" && d["pl7.app/feature"] === "peptide") {
+    // `peptide` (peptide-profiling) and `amplicon-sequence`
+    // (synthetic-repertoire-profiler whole-variant sequence) both map to the
+    // peptide scope feature — a single AA protein sequence embedded as-is.
+    if (
+      name === "pl7.app/sequence" &&
+      (d["pl7.app/feature"] === "peptide" || d["pl7.app/feature"] === "amplicon-sequence")
+    ) {
       scopes.push({
         id: e.id,
         feature: "peptide",
