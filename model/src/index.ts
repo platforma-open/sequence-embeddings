@@ -1,5 +1,11 @@
-import type { InferOutputsType } from "@platforma-sdk/model";
-import { BlockModelV3, PColumnCollection } from "@platforma-sdk/model";
+import type { DatasetOption, InferOutputsType } from "@platforma-sdk/model";
+import {
+  BlockModelV3,
+  buildDatasetOptions,
+  createGlobalPObjectId,
+  isPColumnSpec,
+  PColumnCollection,
+} from "@platforma-sdk/model";
 import { kind } from "@platforma-open/milaboratories.sequence-embeddings.kind";
 import { EMBEDDING_MODELS, isCompatible } from "./compat";
 import { blockDataModel } from "./dataModel";
@@ -30,37 +36,14 @@ export type {
   WorkflowStats,
 } from "./types";
 
-/**
- * Input-anchor shape filters for the dataset dropdown. Mirrors the recognised
- * entity-key axis patterns the workflow accepts (see `isKeyAxis`) so the user
- * sees only datasets the block can actually consume:
- *  - Peptide mode (universal naming): `[pl7.app/sampleId, pl7.app/variantKey]`
- *    with the peptide extractionRunId domain on the variant key.
- *  - Antibody/TCR (legacy MiXCR bulk): `[pl7.app/sampleId, pl7.app/vdj/cloneId]`
- *    or `[..., pl7.app/vdj/clonotypeKey]`.
- *  - Antibody/TCR (legacy MiXCR single-cell): `[pl7.app/sampleId, pl7.app/vdj/scClonotypeKey]`.
- *
- * The `pl7.app/isAnchor` annotation marks anchor-defining columns — the
- * upstream block emits one such anchor per dataset.
- */
-const inputAnchorSpecs = [
-  {
-    axes: [{ name: "pl7.app/sampleId" }, { name: "pl7.app/variantKey" }],
-    annotations: { "pl7.app/isAnchor": "true" },
-  },
-  {
-    axes: [{ name: "pl7.app/sampleId" }, { name: "pl7.app/vdj/cloneId" }],
-    annotations: { "pl7.app/isAnchor": "true" },
-  },
-  {
-    axes: [{ name: "pl7.app/sampleId" }, { name: "pl7.app/vdj/clonotypeKey" }],
-    annotations: { "pl7.app/isAnchor": "true" },
-  },
-  {
-    axes: [{ name: "pl7.app/sampleId" }, { name: "pl7.app/vdj/scClonotypeKey" }],
-    annotations: { "pl7.app/isAnchor": "true" },
-  },
-];
+// Key axes of the datasets this block embeds and of their subsets, mirroring the workflow's
+// `isKeyAxis`: peptide variants, MiXCR bulk (cloneId, clonotypeKey) and single-cell clonotypes.
+const DATASET_KEY_AXES: ReadonlySet<string> = new Set([
+  "pl7.app/variantKey",
+  "pl7.app/vdj/cloneId",
+  "pl7.app/vdj/clonotypeKey",
+  "pl7.app/vdj/scClonotypeKey",
+]);
 
 export const platforma = BlockModelV3.create({ dataModel: blockDataModel, kind })
   .args<BlockArgs>((data) => {
@@ -91,6 +74,11 @@ export const platforma = BlockModelV3.create({ dataModel: blockDataModel, kind }
       embeddings: [task],
       mem: data.mem,
       cpu: data.cpu,
+      // The subset's canonical column id, which the workflow stamps as `pl7.app/inputSubset`.
+      // Absent without a filter, so unfiltered args are unchanged.
+      ...(data.filterRef !== undefined && {
+        inputFilter: createGlobalPObjectId(data.filterRef.blockId, data.filterRef.name),
+      }),
     };
   })
   // Prerun feeds a lightweight always-rerun template that reports whether the
@@ -101,11 +89,29 @@ export const platforma = BlockModelV3.create({ dataModel: blockDataModel, kind }
   // state, and the kind's parser accepts it.
   .templateParams((data) => ({
     inputAnchor: data.inputAnchor,
+    filterRef: data.filterRef,
     embedding: data.embedding,
   }))
-  // Dropdown source for the input picker. Refs returned here populate the UI
-  // selector; the user's pick is written back into `data.inputAnchor`.
-  .output("inputOptions", (ctx) => ctx.resultPool.getOptions(inputAnchorSpecs))
+  // Dropdown source for the input picker: datasets, each with its subset columns (e.g.
+  // Repertoire Labeling labels) as filters. The pick is written to `inputAnchor` + `filterRef`.
+  .output(
+    "inputOptions",
+    (ctx): DatasetOption[] =>
+      buildDatasetOptions(ctx, {
+        primary: (spec) =>
+          isPColumnSpec(spec) &&
+          spec.annotations?.["pl7.app/isAnchor"] === "true" &&
+          spec.axesSpec.length === 2 &&
+          spec.axesSpec[0].name === "pl7.app/sampleId" &&
+          DATASET_KEY_AXES.has(spec.axesSpec[1].name),
+        // Only subsets keyed by the entity axis alone: embeddings are per entity
+        filter: (spec) =>
+          isPColumnSpec(spec) &&
+          spec.axesSpec.length === 1 &&
+          DATASET_KEY_AXES.has(spec.axesSpec[0].name),
+        requireEnrichments: false,
+      }) ?? [],
+  )
   // Scope picker config — derived from the connected input's sequence columns.
   // `options` feeds the sequence dropdown; `defaults` (+ receptor/paired) seed the
   // selection on first connection. The UI snapshots a chosen scope (column id(s),
