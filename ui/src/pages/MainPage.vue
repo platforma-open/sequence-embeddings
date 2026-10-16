@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { ScopeConfig } from "@platforma-open/milaboratories.sequence-embeddings.model";
+import { inputSizeStatus } from "@platforma-open/milaboratories.sequence-embeddings.model";
 import type { PlRef } from "@platforma-sdk/model";
 import {
   PlAccordionSection,
@@ -12,7 +13,7 @@ import {
   PlSectionSeparator,
   PlSlideModal,
 } from "@platforma-sdk/ui-vue";
-import { computed, ref, watch } from "vue";
+import { computed, onScopeDispose, ref, watch } from "vue";
 import { useApp } from "../app";
 import EmbeddingSelector from "./EmbeddingSelector.vue";
 import ReportTable from "./ReportTable.vue";
@@ -64,6 +65,38 @@ const slowOnCpu = computed(() => {
     (sel.model === "currab" || (sel.model === "esm2" && (sel.fidelity ?? "standard") === "high"))
   );
 });
+
+// Input-size gate state (same derivation as `.args()`). Only meaningful once a
+// complete selection exists; before that the args lambda reports what's missing.
+const inputSize = computed(() => {
+  const sel = app.model.data.embedding;
+  if (
+    app.model.data.inputAnchor === undefined ||
+    sel.scope === undefined ||
+    sel.model === undefined
+  ) {
+    return undefined;
+  }
+  return inputSizeStatus(app.model.data.inputAnchor, sel, app.model.data.inputSizeCheck);
+});
+
+// The size check is usually sub-second; announce it only if it takes longer than
+// CHECKING_NOTICE_DELAY_MS so the alert doesn't flash on every selection change.
+const CHECKING_NOTICE_DELAY_MS = 2000;
+const showChecking = ref(false);
+let checkingTimer: ReturnType<typeof setTimeout> | undefined;
+watch(
+  () => inputSize.value?.kind === "checking",
+  (checking) => {
+    clearTimeout(checkingTimer);
+    showChecking.value = false;
+    if (checking) {
+      checkingTimer = setTimeout(() => (showChecking.value = true), CHECKING_NOTICE_DELAY_MS);
+    }
+  },
+  { immediate: true },
+);
+onScopeDispose(() => clearTimeout(checkingTimer));
 </script>
 
 <template>
@@ -107,6 +140,23 @@ const slowOnCpu = computed(() => {
       :config="config"
       :disabled="!defaultsLoaded"
     />
+
+    <PlAlert v-if="showChecking" type="info">
+      Checking input size… This waits for the input dataset to finish computing. Run becomes
+      available once the size is confirmed.
+    </PlAlert>
+    <PlAlert v-else-if="inputSize?.kind === 'unknown'" type="error">
+      <strong>The size of this input could not be determined.</strong>
+      Run is disabled because the embedding output may exceed what the platform can store.
+    </PlAlert>
+    <PlAlert v-else-if="inputSize?.kind === 'tooLarge'" type="error">
+      <strong>
+        This input has {{ inputSize.rows.toLocaleString() }} sequences; the selected model supports
+        up to {{ inputSize.max.toLocaleString() }} per run.
+      </strong>
+      Filter the input to fewer sequences, or choose a model with a smaller embedding (the limit
+      scales inversely with embedding size).
+    </PlAlert>
 
     <PlAlert v-if="slowOnCpu" type="warn">
       <strong>The selected model runs best on a GPU — this machine has none.</strong>
