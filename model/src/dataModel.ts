@@ -51,10 +51,11 @@ export const blockDataModel = new DataModelBuilder({ kind })
   .migrate<BlockDataV2>("Ver_2026_06_23_models", migrateV1ToV2)
   .migrate<BlockDataV3>("Ver_2026_07_03_single_selection", migrateV2ToV3)
   // `params` carries the kind's init-params contract, and is undefined when the
-  // block is created outside a template. Both fields it can carry keep a default
+  // block is created outside a template. The fields it can carry keep a default
   // behind them, so a block created without params starts exactly as before.
   .init(({ params }) => ({
     inputAnchor: params?.inputAnchor,
+    filterRef: params?.filterRef,
     // The selection is seeded by the UI on first input connection (specialist-first);
     // starts blank so the dropdowns have an object to bind to before an input exists.
     embedding: params?.embedding ?? {},

@@ -28,7 +28,8 @@ export * from "./types";
  * the matching `inputAnchor` seeds a selection that points at nothing. The
  * contract cannot express that pairing as a type, so both stay optional and the
  * args projection — which already refuses an incomplete selection — is what
- * catches the mismatch at run time.
+ * catches the mismatch at run time. `filterRef` narrows `inputAnchor` to a
+ * subset and likewise means nothing without it.
  *
  * Both fields are optional because the projection hands live state back
  * untouched, and a freshly created block holds `undefined` and `{}` there.
@@ -37,6 +38,8 @@ export * from "./types";
  */
 export type BlockParams = {
   inputAnchor?: PlRef;
+  /** A subset column (`pl7.app/isSubset`) of the dataset; only its entities are embedded. */
+  filterRef?: PlRef;
   embedding?: EmbeddingSelection;
 };
 
@@ -151,7 +154,7 @@ function parseEmbedding(value: unknown): EmbeddingSelection {
 function parseInitializationParams(value: unknown): BlockParams {
   assertParamsObject(value);
 
-  const { inputAnchor, embedding } = value;
+  const { inputAnchor, filterRef, embedding } = value;
 
   // A readable `{ block, name }` reference is expanded to a full `PlRef` before
   // this runs, so `isPlRef` is the only shape to accept here.
@@ -161,8 +164,15 @@ function parseInitializationParams(value: unknown): BlockParams {
     );
   }
 
+  if (filterRef !== undefined && !isPlRef(filterRef)) {
+    throw new Error(
+      "'filterRef' must be a reference to a subset column, written as { block, name }.",
+    );
+  }
+
   return {
     inputAnchor,
+    filterRef,
     embedding: embedding === undefined ? undefined : parseEmbedding(embedding),
   };
 }
