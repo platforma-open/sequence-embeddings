@@ -44,7 +44,7 @@ export type BlockParams = {
 // from it. That is what keeps the run-time check and the compile-time union from
 // drifting: adding a case to the tuple widens the type, and a case added to the
 // type alone does not compile.
-const SCOPE_FEATURES = ["peptide", "CDR3", "VDJRegion", "Fv", "scFv"] as const;
+const SCOPE_FEATURES = ["peptide", "CDR3", "VDJRegion", "Fv", "scFv", "region"] as const;
 const SCOPE_CHAINS = ["A", "B", ""] as const;
 const SCOPE_RECEPTORS = ["IG", "TCRAB", "TCRGD", "unknown"] as const;
 const FIDELITIES = ["high", "standard"] as const;
@@ -112,6 +112,18 @@ function assertSelectedScope(value: unknown): asserts value is SelectedScope {
 
   if (typeof scope.isHeavy !== "boolean") {
     throw new Error("'scope.isHeavy' must be a boolean.");
+  }
+
+  // The output column is named and domained by the region, so a region scope
+  // without one would collide with every other region embedding.
+  if (scope.feature === "region") {
+    if (typeof scope.region !== "string" || scope.region === "") {
+      throw new Error(
+        "'scope.region' must be a non-empty string when 'scope.feature' is 'region'.",
+      );
+    }
+  } else if (scope.region !== undefined) {
+    throw new Error("'scope.region' is only allowed when 'scope.feature' is 'region'.");
   }
 }
 

@@ -19,6 +19,7 @@ const hasInput = computed(() => app.model.data.inputAnchor !== undefined);
 const isRunning = computed(() => app.model.outputs.isRunning === true);
 const stats = computed<WorkflowStats | undefined>(() => app.model.outputs.stats);
 const resultsStale = computed(() => app.model.outputs.resultsStale === true);
+const embeddingFailed = computed(() => app.model.outputs.embeddingFailed === true);
 
 // Columns are additive where it matters: Total = Successfully embedded + Skipped (no sequence)
 // (every input entity ends up in one of those two). Trimmed is a SUBSET of
@@ -117,7 +118,9 @@ const columnDefs = computed<ColDef<StatsRow>[]>(() => {
       field: "embedded",
       headerName: "Successfully embedded",
       type: "numericColumn",
-      valueFormatter: numFmt,
+      // The counts come from a separate pass that succeeds even when embedding fails;
+      // never report sequences as embedded for a run that produced no embeddings.
+      valueFormatter: (p: ValueFormatterParams) => (embeddingFailed.value ? "Failed" : numFmt(p)),
       headerComponentParams: {
         type: "Number",
         tooltip: "Successfully embedded clonotypes/peptides.",

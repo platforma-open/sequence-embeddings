@@ -45,10 +45,11 @@ buildLabel := func(scope) {
 }
 
 // Per-scope value-column domain. VDJ scopes carry their chain; peptide and Fv
-// (which spans both chains) do not.
+// (which spans both chains) do not. A region scope carries its source region
+// verbatim, so embeddings of two different regions stay distinct columns.
 scopeDomain := func(scope) {
 	dom := {
-		"pl7.app/feature": scope.feature,
+		"pl7.app/feature": scope.feature == "region" ? scope.region : scope.feature,
 		"pl7.app/embedding/model": scope.model
 	}
 	if scope.chain != "" {
@@ -60,7 +61,8 @@ scopeDomain := func(scope) {
 // `scope` shape (one selected scope, full per-scope):
 //   {
 //     name:     string,   // file-safe scope name / column id, e.g. "peptide", "CDR3_A"
-//     feature:  string,   // "peptide" | "CDR3" | "VDJRegion" | "Fv" | "scFv"
+//     feature:  string,   // "peptide" | "CDR3" | "VDJRegion" | "Fv" | "scFv" | "region"
+//     region:   string,   // source region feature value, set only when feature is "region"
 //     chain:    string,   // "A" | "B" | "" (peptide / Fv / scFv)
 //     label:    string,   // native picker label, e.g. "Heavy CDR3 aa Primary"
 //     model:    string    // checkpoint tag (any ModelTag; see models.lib MODELS)

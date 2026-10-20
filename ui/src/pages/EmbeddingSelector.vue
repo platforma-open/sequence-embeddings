@@ -11,12 +11,15 @@ import {
   isCompatible,
 } from "@platforma-open/milaboratories.sequence-embeddings.model";
 import type { ListOption } from "@platforma-sdk/ui-vue";
-import { PlBtnGroup, PlDropdown } from "@platforma-sdk/ui-vue";
+import { PlBtnGroup, PlCheckbox, PlDropdown, PlTooltip } from "@platforma-sdk/ui-vue";
 import { computed } from "vue";
 
 // The selection is v-model'd; updates are immutable replacements (new object) so
 // the model's deep-watch tracks them cleanly.
 const selection = defineModel<EmbeddingSelection>({ required: true });
+// "All regions" toggle: when off, `region` scopes (frameworks, CDR1/CDR2, custom
+// regions — ESM-2 only) are left out of the sequence dropdown to keep it short.
+const showAllRegions = defineModel<boolean>("showAllRegions", { default: false });
 // `config` is OPTIONAL: the dropdowns render always (even before an input is
 // connected or while scopes resolve), just with empty options until it arrives.
 // `disabled` greys them out until the caller signals this input's defaults have loaded.
@@ -35,9 +38,17 @@ const inputModels = computed<EmbeddingModelId[]>(() => {
   return [...set].sort((a, b) => EMBEDDING_MODELS[b].priority - EMBEDDING_MODELS[a].priority);
 });
 
-// Sequence dropdown
+// The toggle is offered only when the input has region scopes to reveal.
+const hasRegions = computed(() => scopeOptions.value.some((o) => o.feature === "region"));
+
+// Sequence dropdown. A selected region stays listed even with the toggle off, so
+// unticking never blanks the dropdown or silently clears the selection.
 const sequenceOptions = computed<ListOption<string>[]>(() =>
-  scopeOptions.value.map((o) => ({ value: o.id, label: o.label })),
+  scopeOptions.value
+    .filter(
+      (o) => o.feature !== "region" || showAllRegions.value || o.id === selection.value.scope?.id,
+    )
+    .map((o) => ({ value: o.id, label: o.label })),
 );
 
 // Model dropdown — sequence-first filtering: models that can embed the chosen
@@ -81,18 +92,37 @@ function onFidelity(fidelity: Fidelity) {
 </script>
 
 <template>
-  <PlDropdown
-    :model-value="selection.scope?.id"
-    :options="sequenceOptions"
-    :disabled="disabled"
-    label="Sequence to embed"
-    required
-    @update:model-value="onSequence"
-  >
-    <template #tooltip>
-      Which sequence region to embed. Paired Fv embeds the VH and VL chains together.
-    </template>
-  </PlDropdown>
+  <div class="sequence-row">
+    <PlDropdown
+      class="sequence-dropdown"
+      :model-value="selection.scope?.id"
+      :options="sequenceOptions"
+      :disabled="disabled"
+      label="Sequence to embed"
+      required
+      @update:model-value="onSequence"
+    >
+      <template #tooltip>
+        Which sequence region to embed. Paired Fv embeds the VH and VL chains together.
+      </template>
+    </PlDropdown>
+
+    <PlCheckbox
+      v-if="hasRegions"
+      :model-value="showAllRegions"
+      :disabled="disabled"
+      @update:model-value="(v) => (showAllRegions = v)"
+    >
+      All regions
+      <PlTooltip class="info">
+        <template #tooltip>
+          Also list framework, CDR1/CDR2 and custom regions. These regions can only be embedded with
+          ESM-2, which might not correctly capture their context when they are embedded on their
+          own.
+        </template>
+      </PlTooltip>
+    </PlCheckbox>
+  </div>
 
   <PlDropdown
     :model-value="selection.model"
@@ -121,3 +151,18 @@ function onFidelity(fidelity: Fidelity) {
     </template>
   </PlBtnGroup>
 </template>
+
+<style scoped>
+/* Sequence dropdown and the "All regions" toggle share one row; the dropdown
+   takes the remaining width. */
+.sequence-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.sequence-dropdown {
+  flex: 1;
+  min-width: 0;
+}
+</style>

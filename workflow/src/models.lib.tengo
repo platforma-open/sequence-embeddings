@@ -36,9 +36,12 @@ ll := import("@platforma-sdk/workflow-tengo:ll")
 //                  --pool-special-tokens). See per-model-embedding-extraction.md.
 //   maxLength    : max tokens incl. specials (main.py --max-length; residue cap =
 //                  maxLength − 2). Fitted per checkpoint from its config
+//   minResidues  : optional. Shortest input (residues) the checkpoint was trained
+//                  on; the run report counts sequences below it so the UI can warn
+//                  that their embeddings are unreliable. Absent = no lower bound.
 MODELS := {
-	"esm2-650M": { dim: 1280, label: "ESM-2 (650M)", inputKind: "aa", family: "hf", pairMode: "concat", embLayer: -2, poolSpecials: false, maxLength: 1024 },
-	"esm2-150M": { dim: 640, label: "ESM-2 (150M)", inputKind: "aa", family: "hf", pairMode: "concat", embLayer: -2, poolSpecials: false, maxLength: 1024 },
+	"esm2-650M": { dim: 1280, label: "ESM-2 (650M)", inputKind: "aa", family: "hf", pairMode: "concat", embLayer: -2, poolSpecials: false, maxLength: 1024, minResidues: 11 },
+	"esm2-150M": { dim: 640, label: "ESM-2 (150M)", inputKind: "aa", family: "hf", pairMode: "concat", embLayer: -2, poolSpecials: false, maxLength: 1024, minResidues: 11 },
 	"currab": { dim: 1280, label: "CurrAb", inputKind: "aa", family: "hf", pairMode: "joint", embLayer: -1, poolSpecials: false, maxLength: 322 },
 	"vhhbert": { dim: 768, label: "VHHBERT", inputKind: "aa-spaced", family: "hf", pairMode: "concat", embLayer: -1, poolSpecials: true, maxLength: 183 },
 	"h3berta": { dim: 768, label: "H3BERTa", inputKind: "aa-cdr3-trimmed", family: "hf", pairMode: "concat", embLayer: -1, poolSpecials: true, maxLength: 100 },

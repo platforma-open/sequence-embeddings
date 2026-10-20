@@ -130,6 +130,8 @@ class ScopePlan:
     max_length: int = 0         # per-model truncation cap (tokens incl. specials) for the
                                 # stats-only count; 0 → fall back to args.max_length. The
                                 # embedding pass caps via --max-length (per task), not this.
+    min_residues: int = 0       # shortest input (residues) the model was trained on; rows
+                                # below it are counted as n_short. 0 → no lower bound.
 
 
 @dataclass(frozen=True)
@@ -150,6 +152,7 @@ def parse_plan(plan_path: Path) -> Plan:
             model=s.get("model", ""),
             is_heavy=bool(s.get("isHeavy", True)),
             max_length=int(s.get("maxLength", 0) or 0),
+            min_residues=int(s.get("minResidues", 0) or 0),
         )
         for s in raw["scopes"]
     ]
@@ -812,8 +815,8 @@ def col_present(col: str):
 
 
 def compute_scope_counts(df: pl.DataFrame, source_columns: list[str], max_residues: int,
-                         input_kind: str = "aa", is_joint: bool = False):
-    """Per-scope (n_entities, n_dropped_empty, n_truncated) over the FULL keyspace.
+                         input_kind: str = "aa", is_joint: bool = False, min_residues: int = 0):
+    """Per-scope (n_entities, n_dropped_empty, n_truncated, n_short) over the FULL keyspace.
     Single source of truth for the run-report counts — stream_embed's scope_stats delegates
     here so the embedding and --stats-only paths always agree.
 
@@ -826,10 +829,14 @@ def compute_scope_counts(df: pl.DataFrame, source_columns: list[str], max_residu
     TOGETHER (H<sep>L), so it is the COMBINED length (all chains' residues + one separator per
     join); otherwise each chain is embedded on its own → count per chain and sum. It is None (N/A)
     for `smiles`: PeptideCLM-2 tokenizes the AA→SMILES string, not residues, so an AA-length count
-    is meaningless and SMILES-token truncation can't be predicted here (no tokenizer)."""
+    is meaningless and SMILES-token truncation can't be predicted here (no tokenizer).
+    n_short = present rows with ANY source chain shorter than `min_residues` — inputs below the
+    shortest length the model was trained on, whose embeddings are unreliable. None when the model
+    declares no lower bound (min_residues = 0) or tokenizes SMILES rather than residues."""
     smiles = input_kind == "smiles"
+    count_short = min_residues > 0 and not smiles
     if not all(c in df.columns for c in source_columns):
-        return 0, df.height, (None if smiles else 0)
+        return 0, df.height, (None if smiles else 0), (0 if count_short else None)
     pred = col_present(source_columns[0])
     for c in source_columns[1:]:
         pred = pred & col_present(c)
@@ -847,6 +854,14 @@ def compute_scope_counts(df: pl.DataFrame, source_columns: list[str], max_residu
                 for i, c in enumerate(source_columns)]
         n_trunc = sum(int(x or 0) for x in df.select(aggs).row(0))
 
+    # --- short inputs (below the model's training minimum) ---
+    n_short = None
+    if count_short:
+        any_short = pl.col(source_columns[0]).str.len_chars() < min_residues
+        for c in source_columns[1:]:
+            any_short = any_short | (pl.col(c).str.len_chars() < min_residues)
+        n_short = int(df.select((pred & any_short).cast(pl.Int64).sum()).item() or 0)
+
     # --- embeddable rows (transform-aware) ---
     n_present = int(df.select(pred.cast(pl.Int64).sum()).item() or 0)
     if input_kind == "aa" or n_present == 0:
@@ -861,7 +876,7 @@ def compute_scope_counts(df: pl.DataFrame, source_columns: list[str], max_residu
             1 for i in range(present.height)
             if all(prepare_sequence(cols[j][i], input_kind) != "" for j in range(len(source_columns)))
         )
-    return n_ent, df.height - n_ent, n_trunc
+    return n_ent, df.height - n_ent, n_trunc, n_short
 
 
 def _warn_nonfinite(vecs: np.ndarray) -> np.ndarray:
@@ -1027,8 +1042,9 @@ def stream_embed(plan: Plan, df: pl.DataFrame, embedder, output_dir: Path,
         truncation for a jointly-tokenised pair)."""
         if not viable(sc):
             return 0, 0, 0
-        return compute_scope_counts(df, sc.source_columns, max_residues,
-                                    input_kind=input_kind, is_joint=is_joint(sc))
+        n_ent, n_drop, n_trunc, _ = compute_scope_counts(df, sc.source_columns, max_residues,
+                                                         input_kind=input_kind, is_joint=is_joint(sc))
+        return n_ent, n_drop, n_trunc
 
     stat = {sc.name: scope_stats(sc) for sc in scopes}
     # Output width: a joint pair is one D-vector; otherwise D per source column
@@ -1184,9 +1200,9 @@ def run_stats_only(args, plan: Plan, df: pl.DataFrame, model_name: str) -> int:
         # back to the run's --max-length when the plan omits it.
         max_residues = (sc.max_length or args.max_length) - 2
         sc_is_joint = args.pair_mode == "joint" and len(sc.source_columns) == 2
-        n_ent, n_drop, n_trunc = compute_scope_counts(
+        n_ent, n_drop, n_trunc, n_short = compute_scope_counts(
             df, sc.source_columns, max_residues,
-            input_kind=args.input_kind, is_joint=sc_is_joint)
+            input_kind=args.input_kind, is_joint=sc_is_joint, min_residues=sc.min_residues)
         scopes.append({
             "name": sc.name,
             "feature": sc.feature,
@@ -1202,9 +1218,14 @@ def run_stats_only(args, plan: Plan, df: pl.DataFrame, model_name: str) -> int:
             "n_dropped_empty": n_drop,
             "n_truncated": n_trunc,
         })
+        # Only models with a training minimum report it (absent otherwise → UI shows nothing).
+        if n_short is not None:
+            scopes[-1]["min_residues"] = sc.min_residues
+            scopes[-1]["n_short"] = n_short
         log_message(f"scope {sc.label or sc.name}: {n_ent} embedded"
                     + (f", {n_drop} dropped (empty/partial)" if n_drop else "")
-                    + (f", {n_trunc} truncated >{max_residues} aa" if n_trunc else ""))
+                    + (f", {n_trunc} truncated >{max_residues} aa" if n_trunc else "")
+                    + (f", {n_short} shorter than {sc.min_residues} aa" if n_short else ""))
     # Resolve the device as the embedding pass does, so the report shows what actually ran
     # (cpu/cuda/mps), not just what was requested.
     device = resolve_device(plan.device)
