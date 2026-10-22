@@ -54,15 +54,6 @@ const defaultsLoaded = computed(() => {
   return anchor !== undefined && config.value?.forAnchor === JSON.stringify(anchor);
 });
 
-// Embedded sequences shorter than the model's training minimum.
-// Hidden while the shown results are stale (they no longer match the settings).
-const shortInputs = computed(() => {
-  if (app.model.outputs.resultsStale === true) return undefined;
-  const scope = app.model.outputs.stats?.scopes.find((s) => (s.n_short ?? 0) > 0);
-  if (scope?.n_short === undefined || scope.min_residues === undefined) return undefined;
-  return { count: scope.n_short, minResidues: scope.min_residues, embedded: scope.n_entities };
-});
-
 // GPU-heavy models (CurrAb, ESM-2 650M via High fidelity) run slowly on a CPU-only
 // backend. gpuAvailable comes from the prerun; undefined while it resolves, so
 // only warn on an explicit `false`.
@@ -86,18 +77,6 @@ const slowOnCpu = computed(() => {
         </template>
       </PlBtnGhost>
     </template>
-
-    <PlAlert v-if="shortInputs" type="warn">
-      <strong>
-        {{ shortInputs.count.toLocaleString() }}
-        <template v-if="shortInputs.embedded !== undefined">
-          of {{ shortInputs.embedded.toLocaleString() }}
-        </template>
-        embedded sequences are shorter than {{ shortInputs.minResidues }} amino acids.
-      </strong>
-      ESM-2 was not trained on such short sequences, so their embeddings may not be reliable.
-      Interpret results for these sequences with care.
-    </PlAlert>
 
     <!-- The run-report table renders every state itself (not-ready guidance,
          loading animation, empty overlay, rows). Errors surface via the block

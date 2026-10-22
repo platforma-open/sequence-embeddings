@@ -39,6 +39,11 @@ type StatsRow = {
   // the run can span models with different limits — so the threshold is per row, not
   // a single column header. Undefined if the report didn't carry it.
   maxResidues: number | undefined;
+  // Embedded sequences shorter than the model's training minimum; undefined for models
+  // that declare no minimum (every model but ESM-2).
+  short: number | undefined;
+  // The model's training minimum in residues; undefined when it declares none.
+  minResidues: number | undefined;
 };
 
 const rowData = computed<StatsRow[]>(() =>
@@ -62,6 +67,8 @@ const rowData = computed<StatsRow[]>(() =>
       // not residues, so a residue "Input Limit" is meaningless → show "—" for those rows too.
       maxResidues:
         s.n_truncated !== null && typeof s.max_length === "number" ? s.max_length - 2 : undefined,
+      short: s.n_short,
+      minResidues: s.min_residues,
     };
   }),
 );
@@ -78,6 +85,8 @@ const defaultColDef: ColDef = {
 // Trimming is rare; only surface the Trimmed column when at least one region
 // actually had a truncated sequence.
 const anyTrimmed = computed(() => rowData.value.some((r) => (r.trimmed ?? 0) > 0));
+// Same for sequences below the model's training minimum.
+const anyShort = computed(() => rowData.value.some((r) => (r.short ?? 0) > 0));
 
 const columnDefs = computed<ColDef<StatsRow>[]>(() => {
   const cols: ColDef<StatsRow>[] = [
@@ -176,6 +185,39 @@ const columnDefs = computed<ColDef<StatsRow>[]>(() => {
       } satisfies PlAgHeaderComponentParams,
       flex: 1,
       minWidth: 120,
+    });
+  }
+
+  // Sequences below the shortest length the model was trained on (ESM-2 declares 11
+  // residues). Shown only when at least one row has such sequences; rows for models
+  // without a training minimum show "—".
+  if (anyShort.value) {
+    cols.push({
+      colId: "short",
+      field: "short",
+      headerName: "Too short",
+      type: "numericColumn",
+      valueFormatter: numFmt,
+      headerComponentParams: {
+        type: "Number",
+        tooltip:
+          "Embedded sequences shorter than the model's minimum trained length (see Min trained length).",
+      } satisfies PlAgHeaderComponentParams,
+      flex: 1,
+      minWidth: 110,
+    });
+    cols.push({
+      colId: "minTrainedLength",
+      field: "minResidues",
+      headerName: "Min trained length",
+      type: "numericColumn",
+      valueFormatter: numFmt,
+      headerComponentParams: {
+        type: "Number",
+        tooltip: "Shortest sequence length, in amino acids, the model was trained on.",
+      } satisfies PlAgHeaderComponentParams,
+      flex: 1,
+      minWidth: 140,
     });
   }
 
