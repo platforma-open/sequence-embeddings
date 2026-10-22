@@ -97,7 +97,11 @@ buildEmbeddingOutputSettings := func(scope, keyAxisName) {
 				annotations: annotations
 			}
 		}],
-		storageFormat: "Parquet"
+		storageFormat: "Parquet",
+		// The embedding column is long-format, n_entities * D rows, which overruns the
+		// Polars importer's 2^32 row ceiling on large libraries. DuckDB imports it in
+		// one out-of-core pass with no such limit. 
+		importEngine: "duckdb"
 	}
 }
 
