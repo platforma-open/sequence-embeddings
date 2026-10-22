@@ -1,18 +1,14 @@
 import type { InferOutputsType } from "@platforma-sdk/model";
-import { BlockModelV3, getNumberOfRows, PColumnCollection } from "@platforma-sdk/model";
+import { BlockModelV3, PColumnCollection } from "@platforma-sdk/model";
 import { kind } from "@platforma-open/milaboratories.sequence-embeddings.kind";
 import { EMBEDDING_MODELS, isCompatible } from "./compat";
 import { blockDataModel } from "./dataModel";
-import type { InputSizeCheck } from "./inputSize";
-import { inputSizeKey, inputSizeStatus } from "./inputSize";
 import { buildScopeConfig, isVdjModality, resolveReceptor, SEQUENCE_SELECTORS } from "./scopes";
 import type { BlockArgs, EmbeddingTask, ScopeConfig, WorkflowStats } from "./types";
 
 export { blockDataModel } from "./dataModel";
 // Model catalog + scope↔model compatibility (used by the UI for the card dropdowns).
 export * from "./compat";
-// Pre-run input-size gate (shared by the args lambda and the UI).
-export * from "./inputSize";
 export type {
   AvailableScope,
   BlockArgs,
@@ -82,20 +78,6 @@ export const platforma = BlockModelV3.create({ dataModel: blockDataModel, kind }
     if (sel.model === undefined) throw new Error("Select a model");
     if (!isCompatible(sel.scope.feature, sel.scope.isHeavy, sel.scope.receptor, sel.model)) {
       throw new Error(`${sel.model} cannot embed "${sel.scope.label}"`);
-    }
-    // Input-size gate (see inputSize.ts). Run stays disabled until the size
-    // result for THIS input is mirrored into `data`, and when it is unreadable
-    // or over the limit for this input + model combination.
-    const size = inputSizeStatus(data.inputAnchor, sel, data.inputSizeCheck);
-    if (size.kind === "checking") throw new Error("Checking input size…");
-    if (size.kind === "unknown") {
-      throw new Error("Input size could not be determined; this input is not supported");
-    }
-    if (size.kind === "tooLarge") {
-      throw new Error(
-        `Input has ${size.rows.toLocaleString()} sequences; this model supports up to ` +
-          `${size.max.toLocaleString()} for now`,
-      );
     }
     const task: EmbeddingTask = {
       scope: sel.scope,
@@ -170,32 +152,6 @@ export const platforma = BlockModelV3.create({ dataModel: blockDataModel, kind }
     },
     { retentive: true },
   )
-  // Row count of the selected scope's sequence columns, for the Run-button size
-  // gate. Each column is keyed by the clonotype axis alone, so rows = clonotypes;
-  // a paired Fv scope takes the larger of its two columns. `getNumberOfRows` sums
-  // Parquet chunk stats from resource metadata without downloading blobs.
-  // undefined while the columns' data is still pending (getAnchoredPColumns waits
-  // for it); `rows: null` once ready but unreadable. Stamped with `inputKey` so
-  // the UI can reject a value observed for the previous selection.
-  .output("inputSize", (ctx): InputSizeCheck | undefined => {
-    const ref = ctx.data.inputAnchor;
-    const columns = ctx.data.embedding.scope?.columns;
-    const inputKey = inputSizeKey(ref, columns);
-    if (ref === undefined || columns === undefined || inputKey === undefined) return undefined;
-    const anchorCtx = ctx.resultPool.resolveAnchorCtx({ main: ref });
-    if (!anchorCtx) return undefined;
-    const pool = ctx.resultPool.getAnchoredPColumns(anchorCtx, SEQUENCE_SELECTORS);
-    if (pool === undefined) return undefined;
-    let rows = 0;
-    for (const id of columns) {
-      const col = pool.find((c) => (c.id as string) === (id as string));
-      if (col === undefined) return undefined;
-      const n = getNumberOfRows(col.data);
-      if (n === undefined) return { inputKey, rows: null };
-      rows = Math.max(rows, n);
-    }
-    return { inputKey, rows };
-  })
   // Workflow run summary — device, model, max_length and the per-scope list.
   // Per-scope counts are added post-run (the report step). UI renders this as the
   // "what was computed" panel.

@@ -7,7 +7,6 @@ import type {
   SelectedScope,
 } from "@platforma-open/milaboratories.sequence-embeddings.kind";
 import type { PlRef, SUniversalPColumnId } from "@platforma-sdk/model";
-import type { InputSizeCheck } from "./inputSize";
 
 /**
  * The init-params contract's types live in the kind package, which owns the
@@ -211,17 +210,6 @@ export type BlockDataV3 = {
    * input change.
    */
   embeddingInitializedForAnchor?: string;
-  /**
-   * UI-only: list `region` scopes (frameworks, CDR1/CDR2, custom regions) in the
-   * sequence dropdown. Off/undefined shows only the typical scopes. Not part of the args.
-   */
-  showAllRegions?: boolean;
-  /**
-   * Input-size result mirrored from the `inputSize` output by the UI, so the
-   * args lambda can gate Run on it. Stamped with the input it belongs to; see
-   * `inputSize.ts`. Not part of the args.
-   */
-  inputSizeCheck?: InputSizeCheck;
   /** Advanced resource overrides (GiB / cores); undefined → workflow sizes automatically from device + input. */
   mem?: number;
   cpu?: number;

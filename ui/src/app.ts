@@ -1,5 +1,4 @@
 import {
-  inputSizeKey,
   platforma,
   recommendedModel,
 } from "@platforma-open/milaboratories.sequence-embeddings.model";
@@ -52,18 +51,6 @@ export const sdkPlugin = defineAppV3(platforma, (app) => {
       };
     } // else: no default scope → keep the blank selection (user picks from the dropdowns).
     app.model.data.embeddingInitializedForAnchor = key;
-  });
-
-  // Mirror the model-derived input size into data so `.args()` can gate Run on it
-  watchEffect(() => {
-    const result = app.model.outputs.inputSize;
-    if (result === undefined) return;
-    const data = app.model.data;
-    if (result.inputKey !== inputSizeKey(data.inputAnchor, data.embedding.scope?.columns)) return;
-    const stored = data.inputSizeCheck;
-    if (stored?.inputKey !== result.inputKey || stored.rows !== result.rows) {
-      data.inputSizeCheck = { inputKey: result.inputKey, rows: result.rows };
-    }
   });
 
   return {

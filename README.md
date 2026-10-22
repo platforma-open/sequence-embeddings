@@ -28,7 +28,7 @@ The vectors feed [Embedding Clustering](https://github.com/platforma-open/embedd
 | Block title in app | Sequence Embeddings |
 | Universal model | ESM-2, with Standard or High fidelity |
 | Specialist models | Antibody, paired antibody, nanobody, CDR-H3, TCR, and peptide models |
-| Embeddable regions | Full peptide; CDR3 per chain; full variable domain per chain; paired Fv (antibody only); full scFv construct |
+| Embeddable regions | Full peptide; CDR3 per chain; full variable domain per chain; paired Fv (antibody only); full scFv construct. With ESM-2 only: framework regions, CDR1/CDR2 and custom regions (listed in the sequence dropdown under "ESM-2 only") |
 | Model compatibility | Only models valid for the selected sequence are offered, with a recommendation |
 | Acceleration | GPU used automatically when available |
 | Modalities | Antibodies, TCRs, peptides — bulk and single-cell |
@@ -51,6 +51,8 @@ A fixed-length numeric vector representing a sequence, produced by a protein lan
 ### Which region should I embed?
 
 Whatever the biological question is about. CDR3 for binding-loop comparison; the full variable domain when the whole domain matters; paired Fv when heavy–light context matters; the scFv construct when the construct itself is the unit. Note that full-domain and Fv options need a fully assembled variable domain upstream.
+
+Framework regions, CDR1/CDR2 and any custom regions the input exports are listed in a separate **ESM-2 only** section of the sequence dropdown. Only ESM-2 can embed these, and users should be careful to note that it hasn't been trained specifically to capture their context when they are embedded on their own. ESM-2 was not trained on sequences shorter than 11 amino acids.
 
 ### Universal or specialist model?
 
