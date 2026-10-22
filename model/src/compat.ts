@@ -73,7 +73,7 @@ export const EMBEDDING_MODELS: Record<EmbeddingModelId, EmbeddingModelSpec> = {
     id: "esm2",
     label: "ESM-2 (universal)",
     receptors: ["IG", "TCRAB", "TCRGD"],
-    features: ["peptide", "CDR3", "VDJRegion", "Fv", "scFv"],
+    features: ["peptide", "CDR3", "VDJRegion", "Fv", "scFv", "region"],
     priority: 0, // universal fallback — always beaten by a compatible specialist
   },
   currab: {

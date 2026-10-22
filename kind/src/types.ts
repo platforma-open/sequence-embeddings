@@ -53,8 +53,13 @@ export type EmbeddingModelId =
   | "peptideclm2"
   | "sceptr"; // pass 2 — gated off in compat.ts until its input path lands
 
-/** Embedding scope feature. `Fv` and `scFv` span/merge chains and carry no `chain`. */
-export type ScopeFeature = "peptide" | "CDR3" | "VDJRegion" | "Fv" | "scFv";
+/**
+ * Embedding scope feature. `Fv` and `scFv` span/merge chains and carry no `chain`.
+ *
+ * `region` is any other amino-acid subsequence of a variant the input exports as
+ * its own column.
+ */
+export type ScopeFeature = "peptide" | "CDR3" | "VDJRegion" | "Fv" | "scFv" | "region";
 
 /**
  * One embedding scope the user can select. `columns` carries the workflow-
@@ -89,6 +94,11 @@ export type SelectedScope = {
    *  compatibility validation in the args lambda. `"unknown"` when the producer
    *  declares VDJ data without a receptor — see `ScopeReceptor`. */
   receptor: ScopeReceptor;
+  /**
+   * The source column's region feature value, verbatim from its spec (e.g. `FR2`,
+   * `FR4InFrame`, a custom region name). Set exactly when `feature` is `region`.
+   */
+  region?: string;
 };
 
 /**
