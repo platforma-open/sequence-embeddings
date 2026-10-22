@@ -1,5 +1,11 @@
 # @platforma-open/milaboratories.sequence-embeddings.test
 
+## 1.1.1
+
+### Patch Changes
+
+- ac849cf:
+
 ## 1.1.0
 
 ### Minor Changes
