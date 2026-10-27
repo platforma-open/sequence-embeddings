@@ -12,6 +12,10 @@
  * per-chain VDJRegion column ids (`[VH, VL]`), embedded separately and vector-
  * concatenated by the Python step.
  *
+ * Every other amino-acid sequence column under the anchor axis — a framework or
+ * CDR1/CDR2 loop, a sub-region, a region of a custom scheme, a custom MiXCR span —
+ * becomes a `region` scope.
+ *
  * VDJRegion/Fv are offered only when a native VDJRegion column is present
  * (MiXCR assembled on VDJRegion). CDR3-assembled inputs expose CDR3 only — a
  * reconstructed full chain would be germline-dominated (TCR) or miss somatic
@@ -46,37 +50,21 @@ export const MODALITY_DOMAIN_KEY = "pl7.app/modality";
 export type SeqEntry = { id: SUniversalPColumnId; spec: PColumnSpec; label: string };
 
 /**
- * Selectors for candidate sequence columns under the `main` anchor's key axis.
- * Peptide-family inputs match the first two (`pl7.app/sequence` with a `peptide`
- * or `amplicon-sequence` feature — the latter is the synthetic-repertoire-profiler's
- * whole-variant sequence); antibody/TCR inputs match the VDJ ones. A selector's
- * domain is a single fixed map and can't OR two feature values, so the two
- * peptide-family features need two entries. All filtered on amino-acid alphabet —
- * embeddings read AA sequence.
+ * Selectors for candidate sequence columns under the `main` anchor's key axis,
+ * filtered on amino-acid alphabet only — embeddings read AA sequence. Which scope
+ * a column becomes is decided from its spec in `buildScopeConfig`, so no feature
+ * value is listed here.
+ *
+ * `pl7.app/sequence` covers peptide-extraction (`peptide`) and the
+ * synthetic-repertoire-profiler: its whole-variant sequence (`amplicon-sequence`)
+ * and one column per region, keyed by the region name in `pl7.app/feature`
+ * (FR1…FR4, CDR1…CDR3, sub-regions and custom-scheme regions alike).
  */
 export const SEQUENCE_SELECTORS: AnchoredPColumnSelector[] = [
   {
     axes: [{ anchor: "main", idx: 1 }],
     name: "pl7.app/sequence",
-    domain: { "pl7.app/feature": "peptide", "pl7.app/alphabet": "aminoacid" },
-  },
-  {
-    axes: [{ anchor: "main", idx: 1 }],
-    name: "pl7.app/sequence",
-    // synthetic-repertoire-profiler tags its whole-variant AA sequence with the
-    // generic `amplicon-sequence` feature (shared with other consumers), not
-    // `peptide`. On an amplicon run it is a peptide-family scope; on a VDJ run the
-    // same column is the V-domain and maps to `VDJRegion` — see `buildScopeConfig`.
-    domain: { "pl7.app/feature": "amplicon-sequence", "pl7.app/alphabet": "aminoacid" },
-  },
-  {
-    axes: [{ anchor: "main", idx: 1 }],
-    name: "pl7.app/sequence",
-    // synthetic-repertoire-profiler region subsequence, keyed by region name in
-    // `pl7.app/feature` (FR1…FR4, CDR1…CDR3) rather than on `pl7.app/vdj/sequence`.
-    // CDR3 is the only one that is a scope in its own right, so it is the only one
-    // selected for; it is classified only on a VDJ run (`buildScopeConfig`).
-    domain: { "pl7.app/feature": "CDR3", "pl7.app/alphabet": "aminoacid" },
+    domain: { "pl7.app/alphabet": "aminoacid" },
   },
   {
     axes: [{ anchor: "main", idx: 1 }],
@@ -173,29 +161,33 @@ export function buildScopeConfig(
     const d = e.spec.domain ?? {};
     const assembling = isAssembling(e.spec);
 
-    // `pl7.app/sequence` covers three producers, split by feature and modality.
+    // `pl7.app/sequence` covers two producers, split by feature and modality.
     //
     // On a VDJ run the profiler's whole-variant sequence IS the V-domain, so it maps
     // to `VDJRegion` and its CDR3 region column to `CDR3` — that is what puts the
     // antibody/TCR models in reach. On an amplicon run the same whole-variant column
     // is a flat protein sequence and maps to `peptide`, as does peptide-extraction's.
+    // Every other feature value is a region column and maps to `region` on either
+    // run.
     //
     // `isHeavy` stays false throughout: the profiler declares no chain, so the
     // heavy-only specialists are reached via the relaxed unknown-receptor gate in
     // `compat.ts`, not by asserting a chain the data does not carry.
     if (name === "pl7.app/sequence") {
       const feature = d["pl7.app/feature"];
+      // A sequence column with no feature value names no region — not a scope.
+      if (feature === undefined || feature === "") continue;
       const isWholeVariant = feature === "peptide" || feature === "amplicon-sequence";
-      let scopeFeature: SelectedScope["feature"] | undefined;
+      let scopeFeature: SelectedScope["feature"];
       if (isVdj && feature === "amplicon-sequence") {
         scopeFeature = "VDJRegion";
       } else if (isVdj && feature === "CDR3") {
         scopeFeature = "CDR3";
       } else if (isWholeVariant) {
         scopeFeature = "peptide";
+      } else {
+        scopeFeature = "region";
       }
-      // Region columns on a non-VDJ run, and FR1/CDR1/… generally, are not scopes.
-      if (scopeFeature === undefined) continue;
       scopes.push({
         id: e.id,
         feature: scopeFeature,
@@ -204,6 +196,7 @@ export function buildScopeConfig(
         label: e.label,
         isHeavy: false,
         receptor,
+        ...(scopeFeature === "region" ? { region: feature } : {}),
         assembling,
       });
       continue;
@@ -255,8 +248,21 @@ export function buildScopeConfig(
           assembling,
         });
         if (chain === "A" || chain === "B") vdjByChain[chain] = e.id;
+      } else if (feat !== undefined && feat !== "") {
+        // Any other feature is a region subsequence: FR1…FR4 (FR4InFrame in aa),
+        // CDR1/CDR2, or a custom assembling span such as `{CDR1Begin:FR4End}`.
+        scopes.push({
+          id: e.id,
+          feature: "region",
+          chain,
+          columns: [e.id],
+          label: e.label,
+          isHeavy,
+          receptor,
+          region: feat,
+          assembling,
+        });
       }
-      // FR1/CDR1/… on their own are not selectable scopes — skip.
     }
   }
 
@@ -319,6 +325,7 @@ export function buildScopeConfig(
     label: s.label,
     isHeavy: s.isHeavy,
     receptor: s.receptor,
+    ...(s.region !== undefined ? { region: s.region } : {}),
   });
   const toSelected = (s: Internal): SelectedScope => ({
     id: s.id,
@@ -328,6 +335,7 @@ export function buildScopeConfig(
     label: s.label,
     isHeavy: s.isHeavy,
     receptor: s.receptor,
+    ...(s.region !== undefined ? { region: s.region } : {}),
   });
   return {
     options: scopes.map(toAvailable),

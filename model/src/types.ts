@@ -99,7 +99,7 @@ export type EmbeddingCardV2 = {
  */
 export type WorkflowScopeStats = {
   name: string;
-  feature: "peptide" | "CDR3" | "VDJRegion" | "Fv" | "scFv";
+  feature: ScopeFeature;
   chain: "A" | "B" | "";
   /** Human-readable picker label (e.g. "Heavy CDR3 aa Primary") for the UI report. */
   label: string;
@@ -118,6 +118,12 @@ export type WorkflowScopeStats = {
    *  SMILES models (PeptideCLM-2) tokenize the AA→SMILES string, not residues, so an
    *  AA-length truncation count is meaningless and isn't reported. */
   n_truncated?: number | null;
+  /** Shortest input (residues) the model was trained on. Present only for models
+   *  that declare one (ESM-2). */
+  min_residues?: number;
+  /** Embedded sequences shorter than `min_residues` — their embeddings are unreliable.
+   *  Present only alongside `min_residues`. */
+  n_short?: number;
 };
 
 /**

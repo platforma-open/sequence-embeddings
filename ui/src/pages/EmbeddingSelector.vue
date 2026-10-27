@@ -35,10 +35,19 @@ const inputModels = computed<EmbeddingModelId[]>(() => {
   return [...set].sort((a, b) => EMBEDDING_MODELS[b].priority - EMBEDDING_MODELS[a].priority);
 });
 
-// Sequence dropdown
-const sequenceOptions = computed<ListOption<string>[]>(() =>
-  scopeOptions.value.map((o) => ({ value: o.id, label: o.label })),
-);
+// Sequence dropdown. When the input exports `region` scopes (frameworks, CDR1/CDR2,
+// custom regions — embeddable by ESM-2 only), the list splits into two labelled
+// groups: the typical scopes first, then the regions. PlDropdown renders groups in
+// the order they first appear, so the typical scopes are listed first.
+const sequenceOptions = computed<ListOption<string>[]>(() => {
+  const typical = scopeOptions.value.filter((o) => o.feature !== "region");
+  const regions = scopeOptions.value.filter((o) => o.feature === "region");
+  if (regions.length === 0) return typical.map((o) => ({ value: o.id, label: o.label }));
+  return [
+    ...typical.map((o) => ({ value: o.id, label: o.label, group: "Recommended" })),
+    ...regions.map((o) => ({ value: o.id, label: o.label, group: "ESM-2 only" })),
+  ];
+});
 
 // Model dropdown — sequence-first filtering: models that can embed the chosen
 // scope, or all input-valid models when no scope is chosen yet.

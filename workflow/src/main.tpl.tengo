@@ -23,6 +23,7 @@ canonical := import("@platforma-sdk/workflow-tengo:canonical")
 smart := import("@platforma-sdk/workflow-tengo:smart")
 render := import("@platforma-sdk/workflow-tengo:render")
 json := import("json")
+text := import("text")
 
 columnSpecs := import(":columns")
 models := import(":models")
@@ -174,10 +175,15 @@ wf.body(func(args) {
 
 	// Clean filename-safe scope name (feature[_chain]); the task name appends
 	// the model tag so the same scope embedded by two models/fidelities yields
-	// distinct columns. The model also rides the value column's domain.
+	// distinct columns. The model also rides the value column's domain. A region
+	// scope is named by its region, with anything outside [A-Za-z0-9_] replaced —
+	// a custom MiXCR span such as `{CDR1Begin:FR4End}` is not filename-safe.
 	scopeName := scope.feature
+	if scope.feature == "region" {
+		scopeName = "region_" + text.re_replace("[^A-Za-z0-9_]", scope.region, "_")
+	}
 	if scope.chain != "" {
-		scopeName = scope.feature + "_" + scope.chain
+		scopeName = scopeName + "_" + scope.chain
 	}
 	taskName := scopeName + "__" + modelTag
 
@@ -205,6 +211,7 @@ wf.body(func(args) {
 	s := {
 		name: taskName,
 		feature: scope.feature,
+		region: scope.region,
 		chain: scope.chain,
 		label: scope.label,
 		model: modelTag
@@ -276,7 +283,7 @@ wf.body(func(args) {
 	for i, col in scopeCols {
 		statsCols["seq" + string(i)] = col
 	}
-	statsScopes = append(statsScopes, {
+	statsScope := {
 		name: taskName,
 		feature: scope.feature,
 		chain: scope.chain,
@@ -284,7 +291,12 @@ wf.body(func(args) {
 		model: modelTag,
 		maxLength: taskModel.maxLength,   // per-model truncation cap for the count
 		sourceColumns: srcHeaders
-	})
+	}
+	// Per-model lower bound for the short-input count (ESM-2 only today).
+	if !is_undefined(taskModel.minResidues) {
+		statsScope.minResidues = taskModel.minResidues
+	}
+	statsScopes = append(statsScopes, statsScope)
 
 	finalPf := pf.build()
 

@@ -162,6 +162,19 @@ export const platforma = BlockModelV3.create({ dataModel: blockDataModel, kind }
   // Per-scope counts are added post-run (the report step). UI renders this as the
   // "what was computed" panel.
   .output("stats", (ctx) => ctx.outputs?.resolve("stats")?.getDataAsJson<WorkflowStats>())
+  // Whether the batched embedding step failed.
+  // A failed batch reaches `embeddings` as an input error deep in its PFrame, not
+  // as an error on the resource itself (`getError()` stays empty), and resolving
+  // the field throws it. Catch that throw as the failure signal; while the step is
+  // still running the field resolves without throwing.
+  .output("embeddingFailed", (ctx) => {
+    try {
+      ctx.outputs?.resolve("embeddings");
+      return false;
+    } catch {
+      return true;
+    }
+  })
   // Quick gate for the UI's "running" indicator. Mirrors sequence-properties.
   .output("isRunning", (ctx) => ctx.outputs?.getIsReadyOrError() === false)
   // Whether the displayed results predate the current settings: true when the

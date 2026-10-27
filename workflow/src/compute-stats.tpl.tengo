@@ -3,7 +3,7 @@
 // Owns the whole counting computation: builds the full-source TSV from the passed
 // source columns, assembles the all-scope plan, and runs the embeddings Python
 // software in --stats-only mode (no model load, no embedding) to count per-scope
-// n_entities / n_dropped / n_truncated (reusing the embedding step's scope_stats)
+// n_entities / n_dropped / n_truncated / n_short (reusing the embedding step's scope_stats)
 // plus device / model / max_length. Output is `stats` (the stats.json content).
 //
 // Rendered as a PURE template (render.create) so it is content-addressed by
@@ -86,6 +86,8 @@ self.body(func(inputs) {
 			// Per-model truncation cap, so n_truncated is counted against the same
 			// limit the embedding step used (0 → run_stats_only uses its default).
 			maxLength: is_undefined(sc.maxLength) ? 0 : sc.maxLength,
+			// Shortest input the model was trained on; 0 = no lower bound (no short count).
+			minResidues: is_undefined(sc.minResidues) ? 0 : sc.minResidues,
 			sourceColumns: sc.sourceColumns
 		})
 	}
