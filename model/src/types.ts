@@ -202,6 +202,8 @@ export type BlockDataV2 = {
  */
 export type BlockDataV3 = {
   inputAnchor?: PlRef;
+  /** Subset column picked with the dataset in PlDatasetSelector (e.g. a Repertoire Labeling label). */
+  filterRef?: PlRef;
   /** The single (scope, model, fidelity?) selection the user assembles. */
   embedding: EmbeddingSelection;
   /**
@@ -238,6 +240,8 @@ export type EmbeddingTask = {
  */
 export type BlockArgs = {
   inputAnchor: PlRef;
+  /** Canonical id of the subset column; set only when a filter is picked. */
+  inputFilter?: string;
   /** Tasks to emit — a 1-element list projected from `data.embedding` (validated complete + compatible). */
   embeddings: EmbeddingTask[];
   /** Advanced resource overrides for the embedding step (GiB / cores); undefined → workflow sizes automatically. */

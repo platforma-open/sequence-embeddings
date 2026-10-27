@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import type { ScopeConfig } from "@platforma-open/milaboratories.sequence-embeddings.model";
-import type { PlRef } from "@platforma-sdk/model";
+import type { DatasetSelection, PlRef } from "@platforma-sdk/model";
+import { createDatasetSelection, createPrimaryRef, plRefsEqual } from "@platforma-sdk/model";
 import {
   PlAccordionSection,
   PlAlert,
   PlBlockPage,
   PlBtnGhost,
-  PlDropdownRef,
+  PlDatasetSelector,
   PlMaskIcon24,
   PlNumberField,
   PlSectionSeparator,
@@ -31,19 +32,35 @@ watch(
   },
 );
 
-// Setter, not a watch on `inputAnchor`. A watcher would fire on server-patch
-// object replacements (other client edits, app reopen) and reset state the user
-// did not touch.
-function setInput(ref?: PlRef) {
-  app.model.data.inputAnchor = ref;
-  // Set the subtitle label here
-  const match = ref
-    ? (app.model.outputs.inputOptions ?? []).find(
-        (o) => o.ref?.blockId === ref.blockId && o.ref?.name === ref.name,
-      )
-    : undefined;
-  app.model.data.defaultBlockLabel = match?.label ?? "";
-}
+// The subtitle label of the picked entry: the subset's when one is picked (its label already
+// carries the dataset as a prefix), else the dataset's.
+const labelFor = (ref: PlRef | undefined, filter: PlRef | undefined) => {
+  if (ref === undefined) return "";
+  const option = app.model.outputs.inputOptions?.find((o) => plRefsEqual(o.primary.ref, ref, true));
+  if (filter !== undefined) {
+    const filterLabel = option?.filters?.find((f) => plRefsEqual(f.ref, filter, true))?.label;
+    if (filterLabel !== undefined) return filterLabel;
+  }
+  return option?.primary.label ?? "";
+};
+
+// A dataset, or a dataset narrowed by a subset column. A setter, not a watch on `inputAnchor`:
+// a watcher would also fire on server-patch object replacements and reset untouched state.
+const datasetSelection = computed<DatasetSelection | undefined>({
+  get: () => {
+    const { inputAnchor, filterRef } = app.model.data;
+    if (inputAnchor === undefined) return undefined;
+    return createDatasetSelection(createPrimaryRef(inputAnchor, filterRef));
+  },
+  set: (selection) => {
+    app.model.data.inputAnchor = selection?.primary.column;
+    app.model.data.filterRef = selection?.primary.filter;
+    app.model.data.defaultBlockLabel = labelFor(
+      selection?.primary.column,
+      selection?.primary.filter,
+    );
+  },
+});
 
 const config = computed<ScopeConfig | undefined>(() => app.model.outputs.availableScopes);
 
@@ -87,19 +104,18 @@ const slowOnCpu = computed(() => {
   <PlSlideModal v-model="settingsOpen" close-on-outside-click shadow>
     <template #title>Settings</template>
 
-    <PlDropdownRef
-      :model-value="app.model.data.inputAnchor"
+    <PlDatasetSelector
+      v-model="datasetSelection"
       :options="app.model.outputs.inputOptions"
       label="Input dataset"
       clearable
       required
-      @update:model-value="setInput"
     >
       <template #tooltip>
         Select the output from a clonotyping / profiling block (Peptide Profiling, MiXCR
         Clonotyping, Import V(D)J Data, etc.).
       </template>
-    </PlDropdownRef>
+    </PlDatasetSelector>
 
     <!-- Sequence and Model dropdowns -->
     <EmbeddingSelector

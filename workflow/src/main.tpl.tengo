@@ -22,6 +22,7 @@ pSpec := import("@platforma-sdk/workflow-tengo:pframes.spec")
 canonical := import("@platforma-sdk/workflow-tengo:canonical")
 smart := import("@platforma-sdk/workflow-tengo:smart")
 render := import("@platforma-sdk/workflow-tengo:render")
+json := import("json")
 text := import("text")
 
 columnSpecs := import(":columns")
@@ -70,6 +71,11 @@ wf.prepare(func(args) {
 		bb.addSingle(colId)
 	}
 
+	// Optional subset column picked alongside the dataset (PlDatasetSelector)
+	if !is_undefined(args.inputFilter) {
+		bb.addRef(json.decode(args.inputFilter))
+	}
+
 	return { columns: bb.build() }
 })
 
@@ -100,6 +106,16 @@ wf.body(func(args) {
 	}
 	keyAxisName := keyAxisSpec.name
 
+	// Optional subset: only its entities are embedded and counted. The trace roots in the
+	// filter so downstream labels name it.
+	filterColumn := undefined
+	traceSpec := datasetSpec
+	if !is_undefined(args.inputFilter) {
+		f := bundle.getColumn(json.decode(args.inputFilter))
+		filterColumn = { spec: f.spec, data: f.data }
+		traceSpec = f.spec
+	}
+
 	// Device tier (shared by every task; the model choice is per-task).
 	device := "cpu"
 	if exec.hasGpu {
@@ -122,22 +138,26 @@ wf.body(func(args) {
 		embedMeta.mem = smart.createJsonResource(args.mem)
 	}
 
-	// Provenance trace seeded from the input dataset. The trace label and id carry
-	// the MODEL, so two columns embedding the same scope with different models get
+	// Provenance trace seeded from the input dataset (its subset on a subset run). The
+	// trace label and id carry the MODEL, so two columns embedding the same scope with different models get
 	// distinct provenance (hence distinct downstream labels), not merely a different
 	// pl7.app/embedding/model domain. Built per model (the per-column model also
 	// rides the value column's pl7.app/embedding/model domain).
 	makeStamp := func(modelTag) {
-		trace := pSpec.makeTrace(datasetSpec, {
+		trace := pSpec.makeTrace(traceSpec, {
 			type: "milaboratories.sequence-embeddings",
 			importance: 30,
 			label: "Sequence Embeddings (" + models.label(modelTag) + ")",
 			id: blockId + "/" + modelTag
 		})
 		return func(spec) {
-			return trace.inject(columnSpecs.cloneSpec(spec,
+			out := trace.inject(columnSpecs.cloneSpec(spec,
 				{ "pl7.app/blockId": blockId },
 				undefined))
+			if !is_undefined(filterColumn) {
+				out.domain["pl7.app/inputSubset"] = args.inputFilter
+			}
+			return out
 		}
 	}
 
@@ -171,6 +191,10 @@ wf.body(func(args) {
 	// the plan's sourceColumns the Python step reads.
 	primaryCol := bundle.getColumn(scope.columns[0])
 	primaryEntry := { src: { spec: primaryCol.spec, data: primaryCol.data }, header: "seq0" }
+	// With a subset, the primary keeps only its entities; the other columns only fill those rows
+	if !is_undefined(filterColumn) {
+		primaryEntry.src = { __isPrimaryRef: "v1", column: primaryEntry.src, filter: filterColumn }
+	}
 	srcHeaders := ["seq0"]
 	scopeCols := [primaryCol]
 	secondaryEntries := []
@@ -286,7 +310,7 @@ wf.body(func(args) {
 	// pairing as the embed pass; otherwise smiles/cdr3-trim drops and joint combined-length
 	// truncation would be miscounted (single model per run, one value each).
 	reportModelTag := modelTag
-	statsRender := render.create(computeStatsTpl, {
+	statsInputs := {
 		cols: statsCols,
 		scopes: statsScopes,
 		keyAxisSpec: keyAxisSpec,
@@ -295,7 +319,12 @@ wf.body(func(args) {
 		modelTag: reportModelTag,
 		inputKind: taskModel.inputKind,
 		pairMode: taskModel.pairMode
-	}, {
+	}
+	// Only for a subset run, so a full-data run keeps exactly its previous inputs
+	if !is_undefined(filterColumn) {
+		statsInputs.filter = filterColumn
+	}
+	statsRender := render.create(computeStatsTpl, statsInputs, {
 		metaInputs: { cpu: 1, mem: 4 }
 	})
 

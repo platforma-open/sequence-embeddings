@@ -34,6 +34,7 @@ self.validateInputs({
 	// each scope carries its OWN model, which is what the per-row report uses
 	inputKind: "string",    // the run's model sequence prep -> --input-kind (transform-aware counts)
 	pairMode: "string",     // "concat" | "joint" -> --pair-mode (joint = combined-length truncation)
+	"filter,?": "any",      // subset column {spec,data}; set only on a subset run
 	"cpu,?": "number",      // metaInput — scheduling only, NOT in the content-ID
 	"mem,?": "number"       // metaInput (GiB) — scheduling only, NOT in the content-ID
 })
@@ -51,12 +52,22 @@ self.body(func(inputs) {
 	// column shared by Fv and a standalone chain appears once, under one header that
 	// both scopes' sourceColumns point at), so the builder never sees a duplicate
 	// internalId here.
-	seqTb := pframes.tsvFileBuilder()
+	seqTb := undefined
+	addSourceColumn := undefined
+	if is_undefined(inputs.filter) {
+		seqTb = pframes.tsvFileBuilder()
+		addSourceColumn = func(header, col) { seqTb.add(col, { header: header }) }
+	} else {
+		// Each column is its own filtered primary, full-joined: the rows stay the union of the
+		// columns, restricted to the subset
+		seqTb = pframes.tableBuilder("tsv").setJoinMode("full")
+		addSourceColumn = func(header, col) {
+			seqTb.addPrimary(header, { __isPrimaryRef: "v1", column: col, filter: inputs.filter }, { header: header })
+		}
+	}
 	seqTb.setAxisHeader(inputs.keyAxisSpec, inputs.keyCol)
 	// Deterministic column order: maps.forEach iterates in key-sorted order.
-	maps.forEach(inputs.cols, func(header, col) {
-		seqTb.add(col, { header: header })
-	})
+	maps.forEach(inputs.cols, addSourceColumn)
 	seqTb.mem(string(memGiB) + "GiB")
 	seqTb.cpu(cpu)
 	sourceTsv := seqTb.build()
