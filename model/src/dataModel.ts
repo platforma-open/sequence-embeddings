@@ -13,14 +13,12 @@ import type { BlockDataV1, BlockDataV2, BlockDataV3, EmbeddingCardV2 } from "./t
 function migrateV1ToV2(v1: BlockDataV1): BlockDataV2 {
   return {
     inputAnchor: v1.inputAnchor,
-    embeddings: v1.selectedScopes.map(
-      (s): EmbeddingCardV2 => ({
-        id: s.id,
-        scope: { ...s, isHeavy: false, receptor: "IG" },
-        model: "esm2",
-        fidelity: v1.fidelity,
-      }),
-    ),
+    embeddings: v1.selectedScopes.map((s): EmbeddingCardV2 => ({
+      id: s.id,
+      scope: { ...s, isHeavy: false, receptor: "IG" },
+      model: "esm2",
+      fidelity: v1.fidelity,
+    })),
     embeddingsInitializedForAnchor: v1.scopesInitializedForAnchor,
     mem: v1.mem,
     cpu: v1.cpu,
